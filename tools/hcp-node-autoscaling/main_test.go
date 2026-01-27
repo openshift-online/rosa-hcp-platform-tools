@@ -30,45 +30,25 @@ func TestCategorizeCluster(t *testing.T) {
 			name: "needs-removal: has cluster-size-override with other annotations",
 			annotations: map[string]string{
 				"hypershift.openshift.io/cluster-size-override":          "m52xl",
-				"hypershift.openshift.io/topology":                       "dedicated-request-serving-components",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
 			},
 			expected: "needs-removal",
 		},
 		{
-			name: "already-configured: has both required annotations",
+			name: "already-configured: has required annotation",
 			annotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "dedicated-request-serving-components",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
 			},
 			expected: "already-configured",
 		},
 		{
-			name: "ready-for-migration: missing topology annotation",
-			annotations: map[string]string{
-				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
-			},
-			expected: "ready-for-migration",
-		},
-		{
-			name: "ready-for-migration: missing auto-scaling annotation",
-			annotations: map[string]string{
-				"hypershift.openshift.io/topology": "dedicated-request-serving-components",
-			},
-			expected: "ready-for-migration",
-		},
-		{
-			name: "ready-for-migration: wrong topology value",
-			annotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "wrong-value",
-				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
-			},
-			expected: "ready-for-migration",
+			name:        "ready-for-migration: missing auto-scaling annotation",
+			annotations: map[string]string{},
+			expected:    "ready-for-migration",
 		},
 		{
 			name: "ready-for-migration: wrong auto-scaling value",
 			annotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "dedicated-request-serving-components",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "false",
 			},
 			expected: "ready-for-migration",
@@ -287,39 +267,30 @@ func TestHasRequiredAnnotations(t *testing.T) {
 		expected    bool
 	}{
 		{
-			name: "has both required annotations with correct values",
+			name: "has required annotation with correct value",
 			annotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "dedicated-request-serving-components",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
 			},
 			expected: true,
 		},
 		{
-			name: "missing topology annotation",
+			name: "has required annotation with other annotations",
 			annotations: map[string]string{
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+				"other.annotation": "value",
 			},
-			expected: false,
+			expected: true,
 		},
 		{
 			name: "missing auto-scaling annotation",
 			annotations: map[string]string{
-				"hypershift.openshift.io/topology": "dedicated-request-serving-components",
-			},
-			expected: false,
-		},
-		{
-			name: "wrong topology value",
-			annotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "wrong-value",
-				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+				"other.annotation": "value",
 			},
 			expected: false,
 		},
 		{
 			name: "wrong auto-scaling value",
 			annotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "dedicated-request-serving-components",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "false",
 			},
 			expected: false,
@@ -363,35 +334,31 @@ func TestPatchManifestWorkAnnotations(t *testing.T) {
 		expectedAnnotations map[string]string
 	}{
 		{
-			name: "adds annotations to cluster without existing annotations",
+			name: "adds annotation to cluster without existing annotations",
 			initialAnnotations: map[string]string{
 				"other.annotation": "value",
 			},
 			expectError: false,
 			expectedAnnotations: map[string]string{
-				"other.annotation":                                       "value",
-				"hypershift.openshift.io/topology":                       "dedicated-request-serving-components",
+				"other.annotation": "value",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
 			},
 		},
 		{
-			name:               "adds annotations to cluster with no annotations",
+			name:               "adds annotation to cluster with no annotations",
 			initialAnnotations: map[string]string{},
 			expectError:        false,
 			expectedAnnotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "dedicated-request-serving-components",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
 			},
 		},
 		{
-			name: "updates existing annotations",
+			name: "updates existing annotation",
 			initialAnnotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "old-value",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "false",
 			},
 			expectError: false,
 			expectedAnnotations: map[string]string{
-				"hypershift.openshift.io/topology":                       "dedicated-request-serving-components",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
 			},
 		},
@@ -453,7 +420,6 @@ func TestPatchManifestWorkAnnotations(t *testing.T) {
 				metadata["annotations"] = annotations
 			}
 
-			annotations["hypershift.openshift.io/topology"] = "dedicated-request-serving-components"
 			annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"] = "true"
 
 			for key, expectedValue := range tt.expectedAnnotations {
@@ -467,9 +433,6 @@ func TestPatchManifestWorkAnnotations(t *testing.T) {
 				}
 			}
 
-			if annotations["hypershift.openshift.io/topology"] != "dedicated-request-serving-components" {
-				t.Errorf("topology annotation not set correctly")
-			}
 			if annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"] != "true" {
 				t.Errorf("auto-scaling annotation not set correctly")
 			}

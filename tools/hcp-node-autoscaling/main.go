@@ -359,13 +359,9 @@ func (a *auditOpts) categorizeCluster(hc *hypershiftv1beta1.HostedCluster) strin
 		return "needs-removal"
 	}
 
-	topology, hasTopology := hc.Annotations["hypershift.openshift.io/topology"]
 	autoScaling, hasAutoScaling := hc.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
 
-	hasCorrectTopology := hasTopology && topology == "dedicated-request-serving-components"
-	hasCorrectAutoScaling := hasAutoScaling && autoScaling == "true"
-
-	if hasCorrectTopology && hasCorrectAutoScaling {
+	if hasAutoScaling && autoScaling == "true" {
 		return "already-configured"
 	}
 
@@ -767,7 +763,6 @@ func (m *migrateOpts) patchManifestWork(ctx context.Context, clusterID string) e
 			metadata["annotations"] = annotations
 		}
 
-		annotations["hypershift.openshift.io/topology"] = "dedicated-request-serving-components"
 		annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"] = "true"
 
 		jsonData, err := json.Marshal(manifestData)
@@ -855,11 +850,9 @@ func (m *migrateOpts) hasRequiredAnnotations(hc *hypershiftv1beta1.HostedCluster
 		return false
 	}
 
-	topology, hasTopology := annotations["hypershift.openshift.io/topology"]
 	autoScaling, hasAutoScaling := annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
 
-	return hasTopology && topology == "dedicated-request-serving-components" &&
-		hasAutoScaling && autoScaling == "true"
+	return hasAutoScaling && autoScaling == "true"
 }
 
 // displayCandidates prints the list of clusters ready for migration.
@@ -879,8 +872,7 @@ func (m *migrateOpts) displayCandidates(candidates []hostedClusterAuditInfo) {
 	p.Flush()
 	fmt.Println()
 
-	fmt.Println("These clusters will receive the following annotations:")
-	fmt.Println("  - hypershift.openshift.io/topology: dedicated-request-serving-components")
+	fmt.Println("These clusters will receive the following annotation:")
 	fmt.Println("  - hypershift.openshift.io/resource-based-cp-auto-scaling: \"true\"")
 	fmt.Println()
 }
