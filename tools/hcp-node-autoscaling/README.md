@@ -4,12 +4,13 @@ A tool to audit and migrate hosted clusters to resource-based node autoscaling.
 
 ## Overview
 
-This tool provides two subcommands:
+This tool provides three subcommands:
 
 1. **audit**: Analyzes hosted clusters and categorizes them based on autoscaling migration readiness
 2. **migrate**: Patches ManifestWork resources to enable resource-based node autoscaling
+3. **rollback**: Removes autoscaling annotations from a hosted cluster by patching its ManifestWork
 
-The tool inspects cluster annotations and can automatically migrate clusters that are ready for autoscaling.
+The tool inspects cluster annotations and can automatically migrate clusters that are ready for autoscaling, or rollback clusters that were previously migrated.
 
 ## Installation
 
@@ -95,6 +96,38 @@ hcp-node-autoscaling migrate \
   --skip-confirmation
 ```
 
+### Rollback Command
+
+The rollback command removes autoscaling annotations from a previously migrated hosted cluster.
+
+The `--hosted-cluster-id` flag accepts:
+- Cluster name
+- Internal cluster ID
+- External cluster ID
+
+#### Basic Rollback
+
+```bash
+# Using internal cluster ID
+hcp-node-autoscaling rollback --hosted-cluster-id 1a2b3c4d5e6f7g8h9i0j
+```
+
+#### Dry Run
+
+Preview what would be changed without making changes:
+
+```bash
+hcp-node-autoscaling rollback --hosted-cluster-id cluster-123 --dry-run
+```
+
+#### Skip Confirmation
+
+Skip the confirmation prompt (use with caution):
+
+```bash
+hcp-node-autoscaling rollback --hosted-cluster-id cluster-123 --skip-confirmation
+```
+
 ## Cluster Categories
 
 The tool categorizes hosted clusters into three groups:
@@ -131,6 +164,20 @@ The migrate command:
 5. **Reports** migration results including any errors
 
 The migrate command uses elevated permissions (cluster-admin via backplane) to patch ManifestWork resources on the service cluster.
+
+## How Rollback Works
+
+The rollback command:
+
+1. **Queries** OCM to find the management and service clusters for the hosted cluster
+2. **Connects** to the management cluster to locate the hosted cluster
+3. **Verifies** the cluster currently has autoscaling enabled
+4. **Displays** rollback information and asks for confirmation
+5. **Patches** ManifestWork resources on the service cluster to remove the autoscaling annotation
+6. **Verifies** the annotation removal is synced to the management cluster (polls every 15 seconds, 5-minute timeout)
+7. **Reports** rollback result
+
+The rollback command uses elevated permissions (cluster-admin via backplane) to patch ManifestWork resources on the service cluster.
 
 ## Environment Support
 
@@ -288,6 +335,15 @@ Failed: 0
 | `--skip-confirmation` | Skip confirmation prompt | false | No |
 | `-h, --help` | Show help message | - | No |
 
+### Rollback Command
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--hosted-cluster-id` | Hosted cluster ID/name/external-id to rollback | - | Yes |
+| `--dry-run` | Preview changes without applying them | false | No |
+| `--skip-confirmation` | Skip confirmation prompt | false | No |
+| `-h, --help` | Show help message | - | No |
+
 ## Cluster Identifier Flexibility
 
 Both `--mgmt-cluster-id` and `--service-cluster-id` flags accept:
@@ -325,6 +381,17 @@ Performs **write operations**:
 
 Uses elevated permissions (cluster-admin via backplane) with audit trail:
 - Elevation reason: [SREP-2821](https://issues.redhat.com/browse/SREP-2821) Migrating hosted clusters to node autoscaling
+
+### Rollback Command
+Performs **write operations**:
+- Queries OCM to find management and service clusters using `utils.GetManagementCluster` and `utils.GetServiceCluster`
+- Connects to management cluster to locate HostedCluster
+- Reads ManifestWork resources from service cluster
+- Updates ManifestWork resources to remove autoscaling annotations
+- Polls HostedCluster resources on management cluster to verify sync
+
+Uses elevated permissions (cluster-admin via backplane) with audit trail:
+- Elevation reason: [SREP-2821](https://issues.redhat.com/browse/SREP-2821) Rolling back hosted cluster autoscaling migration
 
 ## Dependencies
 

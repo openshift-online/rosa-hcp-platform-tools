@@ -76,6 +76,18 @@ type migrationResult struct {
 	VerifiedAt  string `json:"verified_at,omitempty"`
 }
 
+type rollbackOpts struct {
+	hostedClusterID  string
+	dryRun           bool
+	skipConfirmation bool
+	serviceClient    client.Client
+	mgmtClient       client.Client
+	ocmConn          *sdk.Connection
+	serviceClusterID string
+	mgmtClusterID    string
+	mgmtClusterName  string
+}
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "hcp-node-autoscaling",
@@ -89,6 +101,7 @@ the actual migration.`,
 
 	rootCmd.AddCommand(newAuditCmd())
 	rootCmd.AddCommand(newMigrateCmd())
+	rootCmd.AddCommand(newRollbackCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -185,6 +198,48 @@ This command will:
 
 	_ = cmd.MarkFlagRequired("service-cluster-id")
 	_ = cmd.MarkFlagRequired("mgmt-cluster-id")
+
+	return cmd
+}
+
+// newRollbackCmd creates the rollback subcommand for removing autoscaling from hosted clusters.
+func newRollbackCmd() *cobra.Command {
+	opts := &rollbackOpts{}
+	cmd := &cobra.Command{
+		Use:   "rollback",
+		Short: "Rollback autoscaling for a hosted cluster",
+		Long: `Remove autoscaling annotations from a hosted cluster by patching its ManifestWork resource.
+
+This command will:
+1. Look up the management and service clusters from OCM using the hosted cluster ID
+2. Connect to the management cluster to find the hosted cluster
+3. Connect to the service cluster with elevated permissions
+4. Remove the autoscaling annotation from the ManifestWork
+5. Verify the annotations are synced back to the management cluster`,
+		Example: `
+  # Rollback autoscaling for a hosted cluster
+  hcp-node-autoscaling rollback --hosted-cluster-id 1a2b3c4d5e6f7g8h9i0j
+
+  # Dry run to see what would be changed
+  hcp-node-autoscaling rollback --hosted-cluster-id cluster-123 --dry-run
+
+  # Skip confirmation prompt (use with caution)
+  hcp-node-autoscaling rollback --hosted-cluster-id cluster-123 --skip-confirmation`,
+		Args:              cobra.NoArgs,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return opts.run(context.Background())
+		},
+	}
+
+	cmd.Flags().StringVar(&opts.hostedClusterID, "hosted-cluster-id", "",
+		"The hosted cluster ID/name/external-id to rollback")
+	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false,
+		"Preview changes without applying them")
+	cmd.Flags().BoolVar(&opts.skipConfirmation, "skip-confirmation", false,
+		"Skip confirmation prompt (use with caution)")
+
+	_ = cmd.MarkFlagRequired("hosted-cluster-id")
 
 	return cmd
 }
@@ -912,5 +967,329 @@ func (m *migrateOpts) displayResults(results []migrationResult) {
 		}
 		p.Flush()
 		fmt.Println()
+	}
+}
+
+// run executes the rollback command to remove autoscaling annotations from a hosted cluster.
+func (r *rollbackOpts) run(ctx context.Context) error {
+	if err := r.initialize(ctx); err != nil {
+		return fmt.Errorf("initialization failed: %v", err)
+	}
+	defer r.ocmConn.Close()
+
+	fmt.Println()
+
+	hostedCluster, namespace, err := r.findHostedCluster(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to find hosted cluster: %v", err)
+	}
+
+	if err := r.displayRollbackInfo(hostedCluster, namespace); err != nil {
+		return err
+	}
+
+	if !r.skipConfirmation && !r.dryRun {
+		fmt.Println("\nDo you want to proceed with the rollback?")
+		if !utils.ConfirmPrompt() {
+			return fmt.Errorf("rollback cancelled by user")
+		}
+	}
+
+	if r.dryRun {
+		fmt.Println("\n[DRY RUN] No changes will be applied")
+		return nil
+	}
+
+	result := r.rollbackCluster(ctx, hostedCluster, namespace)
+
+	r.displayRollbackResult(result)
+
+	if result.Status == "failed" {
+		return fmt.Errorf("rollback failed: %s", result.Error)
+	}
+
+	return nil
+}
+
+// initialize validates inputs and creates OCM connections and Kubernetes clients.
+func (r *rollbackOpts) initialize(ctx context.Context) error {
+	if err := utils.IsValidClusterKey(r.hostedClusterID); err != nil {
+		return fmt.Errorf("invalid hosted cluster ID: %v", err)
+	}
+
+	conn, err := utils.CreateConnection()
+	if err != nil {
+		return fmt.Errorf("failed to create OCM connection: %v", err)
+	}
+	r.ocmConn = conn
+
+	hostedCluster, err := utils.GetCluster(conn, r.hostedClusterID)
+	if err != nil {
+		return fmt.Errorf("failed to get hosted cluster %s: %v", r.hostedClusterID, err)
+	}
+
+	resolvedClusterID := hostedCluster.ID()
+	r.hostedClusterID = resolvedClusterID
+
+	fmt.Printf("Hosted Cluster: %s (%s)\n", hostedCluster.Name(), hostedCluster.ID())
+
+	mgmtCluster, err := utils.GetManagementCluster(resolvedClusterID)
+	if err != nil {
+		return fmt.Errorf("failed to get management cluster for hosted cluster %s: %v", resolvedClusterID, err)
+	}
+
+	r.mgmtClusterID = mgmtCluster.ID()
+	r.mgmtClusterName = mgmtCluster.Name()
+
+	fmt.Printf("Management Cluster: %s (%s)\n", mgmtCluster.Name(), mgmtCluster.ID())
+
+	serviceCluster, err := utils.GetServiceCluster(resolvedClusterID)
+	if err != nil {
+		return fmt.Errorf("failed to get service cluster for hosted cluster %s: %v", resolvedClusterID, err)
+	}
+
+	r.serviceClusterID = serviceCluster.ID()
+
+	fmt.Printf("Service Cluster: %s (%s)\n", serviceCluster.Name(), serviceCluster.ID())
+
+	scheme := runtime.NewScheme()
+	if err := hypershiftv1beta1.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("failed to add hypershift scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("failed to add core v1 scheme: %v", err)
+	}
+	if err := workv1.Install(scheme); err != nil {
+		return fmt.Errorf("failed to add work v1 scheme: %v", err)
+	}
+
+	mgmtClient, err := k8s.New(r.mgmtClusterID, client.Options{Scheme: scheme})
+	if err != nil {
+		return fmt.Errorf("failed to create management cluster client: %v", err)
+	}
+	r.mgmtClient = mgmtClient
+
+	elevationReason := "SREP-2821 - Rolling back hosted cluster autoscaling migration"
+	serviceClient, err := k8s.NewAsBackplaneClusterAdminWithConn(
+		r.serviceClusterID,
+		client.Options{Scheme: scheme},
+		r.ocmConn,
+		elevationReason,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create service cluster client: %v", err)
+	}
+	r.serviceClient = serviceClient
+
+	return nil
+}
+
+// findHostedCluster finds the hosted cluster on the management cluster.
+func (r *rollbackOpts) findHostedCluster(ctx context.Context) (*hypershiftv1beta1.HostedCluster, string, error) {
+	auditOpts := &auditOpts{
+		mgmtClusterID: r.mgmtClusterID,
+		mgmtClient:    r.mgmtClient,
+	}
+
+	namespaces, err := auditOpts.listOcmNamespaces(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to list namespaces: %v", err)
+	}
+
+	for _, ns := range namespaces {
+		hc, err := auditOpts.getHostedClusterInNamespace(ctx, ns.Name)
+		if err != nil {
+			continue
+		}
+
+		clusterID := hc.Labels["api.openshift.com/id"]
+		if clusterID == r.hostedClusterID || hc.Name == r.hostedClusterID {
+			return hc, ns.Name, nil
+		}
+	}
+
+	return nil, "", fmt.Errorf("hosted cluster %s not found on management cluster %s", r.hostedClusterID, r.mgmtClusterID)
+}
+
+// displayRollbackInfo shows information about the cluster to be rolled back.
+func (r *rollbackOpts) displayRollbackInfo(hc *hypershiftv1beta1.HostedCluster, namespace string) error {
+	clusterID := hc.Labels["api.openshift.com/id"]
+	currentSize := hc.Labels["hypershift.openshift.io/hosted-cluster-size"]
+
+	autoScaling, hasAutoScaling := hc.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+
+	fmt.Printf("=== Rollback Configuration ===\n\n")
+	fmt.Printf("Hosted Cluster ID: %s\n", clusterID)
+	fmt.Printf("Hosted Cluster Name: %s\n", hc.Name)
+	fmt.Printf("Namespace: %s\n", namespace)
+	fmt.Printf("Current Size: %s\n", currentSize)
+	fmt.Printf("\nCurrent autoscaling annotation: %s=%s\n",
+		"hypershift.openshift.io/resource-based-cp-auto-scaling", autoScaling)
+
+	if !hasAutoScaling || autoScaling != "true" {
+		return fmt.Errorf("cluster does not have autoscaling enabled (annotation not set or not 'true')")
+	}
+
+	fmt.Printf("\nThis will remove the annotation: hypershift.openshift.io/resource-based-cp-auto-scaling\n")
+
+	return nil
+}
+
+// rollbackCluster removes autoscaling annotations from the cluster's ManifestWork.
+func (r *rollbackOpts) rollbackCluster(ctx context.Context, hc *hypershiftv1beta1.HostedCluster, namespace string) migrationResult {
+	clusterID := hc.Labels["api.openshift.com/id"]
+
+	result := migrationResult{
+		ClusterID:   clusterID,
+		ClusterName: hc.Name,
+	}
+
+	if err := r.removeManifestWorkAnnotation(ctx, clusterID); err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("failed to patch ManifestWork: %v", err)
+		return result
+	}
+
+	fmt.Printf("\n  - Removed annotation from ManifestWork on service cluster\n")
+
+	if err := r.waitForRollbackSync(ctx, namespace, hc.Name); err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("sync verification failed: %v", err)
+		return result
+	}
+
+	result.Status = "success"
+	result.VerifiedAt = time.Now().Format(time.RFC3339)
+	return result
+}
+
+// removeManifestWorkAnnotation removes autoscaling annotations from the HostedCluster manifest in ManifestWork.
+func (r *rollbackOpts) removeManifestWorkAnnotation(ctx context.Context, clusterID string) error {
+	manifestWork := &workv1.ManifestWork{}
+	err := r.serviceClient.Get(ctx,
+		types.NamespacedName{
+			Name:      clusterID,
+			Namespace: r.mgmtClusterName,
+		},
+		manifestWork)
+
+	if err != nil {
+		return fmt.Errorf("failed to get ManifestWork %s/%s: %v",
+			r.mgmtClusterName, clusterID, err)
+	}
+
+	modified := false
+	for i, manifest := range manifestWork.Spec.Workload.Manifests {
+		if manifest.Raw == nil {
+			continue
+		}
+
+		var manifestData map[string]interface{}
+		if err := json.Unmarshal(manifest.Raw, &manifestData); err != nil {
+			continue
+		}
+
+		kind, _ := manifestData["kind"].(string)
+		if kind != "HostedCluster" {
+			continue
+		}
+
+		metadata, ok := manifestData["metadata"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		annotations, ok := metadata["annotations"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		delete(annotations, "hypershift.openshift.io/resource-based-cp-auto-scaling")
+
+		jsonData, err := json.Marshal(manifestData)
+		if err != nil {
+			return fmt.Errorf("failed to marshal modified manifest: %v", err)
+		}
+
+		manifestWork.Spec.Workload.Manifests[i].Raw = jsonData
+		modified = true
+		break
+	}
+
+	if !modified {
+		return fmt.Errorf("HostedCluster not found in ManifestWork manifests")
+	}
+
+	if err := r.serviceClient.Update(ctx, manifestWork); err != nil {
+		return fmt.Errorf("failed to update ManifestWork: %v", err)
+	}
+
+	return nil
+}
+
+// waitForRollbackSync polls the management cluster until annotation removal is synced or timeout occurs.
+func (r *rollbackOpts) waitForRollbackSync(ctx context.Context, namespace, name string) error {
+	const (
+		pollInterval = 15 * time.Second
+		timeout      = 5 * time.Minute
+	)
+
+	fmt.Printf("  - Waiting for sync (timeout: 5 minutes)...\n")
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	attempt := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled")
+		case <-ticker.C:
+			attempt++
+
+			hc := &hypershiftv1beta1.HostedCluster{}
+			err := r.mgmtClient.Get(ctx,
+				types.NamespacedName{
+					Namespace: namespace,
+					Name:      name,
+				},
+				hc)
+
+			if err != nil {
+				fmt.Printf("  - Attempt %d: failed to get HostedCluster: %v\n", attempt, err)
+
+				if time.Now().After(deadline) {
+					return fmt.Errorf("timeout waiting for sync after %v", timeout)
+				}
+				continue
+			}
+
+			autoScaling, hasAutoScaling := hc.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+
+			if !hasAutoScaling || autoScaling != "true" {
+				fmt.Printf("  - Verified: Annotation removed from management cluster\n")
+				return nil
+			}
+
+			fmt.Printf("  - Attempt %d: Annotation still present\n", attempt)
+
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timeout: annotation was not removed after %v", timeout)
+			}
+		}
+	}
+}
+
+// displayRollbackResult prints the result of the rollback operation.
+func (r *rollbackOpts) displayRollbackResult(result migrationResult) {
+	fmt.Printf("\n=== Rollback Result ===\n\n")
+
+	if result.Status == "success" {
+		fmt.Printf("✓ Successfully rolled back cluster %s (%s)\n", result.ClusterName, result.ClusterID)
+		fmt.Printf("  Verified at: %s\n", result.VerifiedAt)
+	} else {
+		fmt.Printf("✗ Failed to rollback cluster %s (%s)\n", result.ClusterName, result.ClusterID)
+		fmt.Printf("  Error: %s\n", result.Error)
 	}
 }
