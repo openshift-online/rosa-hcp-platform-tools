@@ -117,7 +117,7 @@ func newAuditCmd() *cobra.Command {
 		Short: "Audit hosted clusters on a management cluster for autoscaling migration readiness",
 		Long: `Analyze all hosted clusters on a management cluster and categorize them based on their
 autoscaling migration readiness. Clusters are categorized into:
-- Group A: Needs annotation removal (have cluster-size-override annotation)
+- Group A: Has Override Annotation (have cluster-size-override annotation)
 - Group B: Ready for migration (missing required autoscaling annotations)
 - Already configured (have autoscaling annotations set)`,
 		Example: `
@@ -155,14 +155,18 @@ func newMigrateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "migrate",
 		Short: "Enable autoscaling for hosted clusters on a service cluster",
-		Long: `Perform autoscaling migration for hosted clusters that are ready.
+		Long: `Perform autoscaling migration for hosted clusters.
 
 This command will:
-1. Audit the management cluster to find clusters ready for migration
-2. Display the list and ask for confirmation
-3. Patch ManifestWork resources on the service cluster
-4. Verify the annotations are synced to the management cluster
-5. Report results`,
+1. Audit the management cluster to find clusters for migration
+2. Include clusters without autoscaling (even if they have cluster-size-override)
+3. Display the list and ask for confirmation
+4. Patch ManifestWork resources on the service cluster
+5. Verify the annotations are synced to the management cluster
+6. Report results
+
+Note: Clusters with cluster-size-override annotation will also be migrated.
+The override annotation will remain - review and remove manually if needed.`,
 		Example: `
   # Migrate clusters with confirmation
   hcp-node-autoscaling migrate \
@@ -325,19 +329,37 @@ func (a *auditOpts) run(ctx context.Context) error {
 			continue
 		}
 
-		switch info.Category {
-		case "needs-removal":
+		_, hasOverride := info.Annotations["hypershift.openshift.io/cluster-size-override"]
+		autoScaling, hasAutoScaling := info.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+		hasAutoscalingEnabled := hasAutoScaling && autoScaling == "true"
+
+		if hasOverride {
 			results.NeedsLabelRemoval = append(results.NeedsLabelRemoval, *info)
-		case "ready-for-migration":
-			results.ReadyForMigration = append(results.ReadyForMigration, *info)
-		case "already-configured":
-			results.AlreadyConfigured = append(results.AlreadyConfigured, *info)
+			if hasAutoscalingEnabled {
+				results.AlreadyConfigured = append(results.AlreadyConfigured, *info)
+			} else {
+				results.ReadyForMigration = append(results.ReadyForMigration, *info)
+			}
+		} else {
+			if hasAutoscalingEnabled {
+				results.AlreadyConfigured = append(results.AlreadyConfigured, *info)
+			} else {
+				results.ReadyForMigration = append(results.ReadyForMigration, *info)
+			}
 		}
 	}
 
-	results.TotalScanned = len(results.NeedsLabelRemoval) +
-		len(results.ReadyForMigration) +
-		len(results.AlreadyConfigured)
+	uniqueClusters := make(map[string]bool)
+	for _, info := range results.NeedsLabelRemoval {
+		uniqueClusters[info.ClusterID] = true
+	}
+	for _, info := range results.ReadyForMigration {
+		uniqueClusters[info.ClusterID] = true
+	}
+	for _, info := range results.AlreadyConfigured {
+		uniqueClusters[info.ClusterID] = true
+	}
+	results.TotalScanned = len(uniqueClusters)
 
 	if a.showOnly != "" {
 		results = a.applyFilter(results)
@@ -415,7 +437,6 @@ func (a *auditOpts) categorizeCluster(hc *hypershiftv1beta1.HostedCluster) strin
 	}
 
 	autoScaling, hasAutoScaling := hc.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
-
 	if hasAutoScaling && autoScaling == "true" {
 		return "already-configured"
 	}
@@ -461,11 +482,12 @@ func (a *auditOpts) outputResults(results *auditResults) error {
 // printTextOutput prints audit results in human-readable text format.
 func (a *auditOpts) printTextOutput(results *auditResults) error {
 	fmt.Printf("\nManagement Cluster: %s\n", results.MgmtClusterID)
-	fmt.Printf("Total Hosted Clusters Scanned: %d\n\n", results.TotalScanned)
+	fmt.Printf("Total Hosted Clusters Scanned: %d\n", results.TotalScanned)
+	fmt.Printf("Note: Clusters with both override and autoscaling annotations appear in multiple groups\n\n")
 
 	if len(results.NeedsLabelRemoval) > 0 {
-		fmt.Printf("=== GROUP A: Needs Annotation Removal (%d clusters) ===\n", len(results.NeedsLabelRemoval))
-		fmt.Println("These clusters have the cluster-size-override annotation that must be removed:")
+		fmt.Printf("=== GROUP A: Has Override Annotation (%d clusters) ===\n", len(results.NeedsLabelRemoval))
+		fmt.Println("Clusters with cluster-size-override annotation (may also have autoscaling enabled):")
 
 		p := printer.NewTablePrinter(os.Stdout, 20, 1, 3, ' ')
 		if !a.noHeaders {
@@ -485,7 +507,7 @@ func (a *auditOpts) printTextOutput(results *auditResults) error {
 
 	if len(results.ReadyForMigration) > 0 {
 		fmt.Printf("=== GROUP B: Ready for Migration (%d clusters) ===\n", len(results.ReadyForMigration))
-		fmt.Println("These clusters can be immediately migrated to autoscaling:")
+		fmt.Println("Clusters ready for autoscaling migration (may also have cluster-size-override to remove):")
 
 		p := printer.NewTablePrinter(os.Stdout, 20, 1, 3, ' ')
 		if !a.noHeaders {
@@ -505,7 +527,7 @@ func (a *auditOpts) printTextOutput(results *auditResults) error {
 
 	if a.showOnly == "" && len(results.AlreadyConfigured) > 0 {
 		fmt.Printf("=== Already Configured (%d clusters) ===\n", len(results.AlreadyConfigured))
-		fmt.Println("These clusters already have autoscaling annotations set:")
+		fmt.Println("Clusters with autoscaling enabled (may also have cluster-size-override to remove):")
 
 		p := printer.NewTablePrinter(os.Stdout, 20, 1, 3, ' ')
 		if !a.noHeaders {
@@ -535,7 +557,7 @@ func (a *auditOpts) printTextOutput(results *auditResults) error {
 	}
 
 	fmt.Println("Summary:")
-	fmt.Printf("  - Group A (Needs annotation removal): %d clusters\n", len(results.NeedsLabelRemoval))
+	fmt.Printf("  - Group A (Has Override Annotation): %d clusters\n", len(results.NeedsLabelRemoval))
 	fmt.Printf("  - Group B (Ready for migration): %d clusters\n", len(results.ReadyForMigration))
 	fmt.Printf("  - Already configured: %d clusters\n", len(results.AlreadyConfigured))
 	fmt.Printf("  - Errors: %d namespaces\n", len(results.Errors))
@@ -676,7 +698,7 @@ func (m *migrateOpts) createClients(ctx context.Context) error {
 		return fmt.Errorf("failed to add work v1 scheme: %v", err)
 	}
 
-	elevationReason := "SREP-2821 - Migrating hosted clusters to node autoscaling"
+	elevationReason := "SREP-2821 - Enabling request serving node autoscaling"
 	serviceClient, err := k8s.NewAsBackplaneClusterAdminWithConn(
 		m.serviceClusterID,
 		client.Options{Scheme: scheme},
@@ -720,7 +742,14 @@ func (m *migrateOpts) getCandidatesForMigration(ctx context.Context) ([]hostedCl
 			continue
 		}
 
-		if info.Category == "ready-for-migration" {
+		// Skip clusters that already have autoscaling enabled
+		autoScaling, hasAutoScaling := info.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+		if hasAutoScaling && autoScaling == "true" {
+			continue
+		}
+
+		// Include clusters that need migration (ready-for-migration or needs-removal)
+		if info.Category != "already-configured" {
 			candidates = append(candidates, *info)
 		}
 	}
@@ -930,6 +959,21 @@ func (m *migrateOpts) displayCandidates(candidates []hostedClusterAuditInfo) {
 	fmt.Println("These clusters will receive the following annotation:")
 	fmt.Println("  - hypershift.openshift.io/resource-based-cp-auto-scaling: \"true\"")
 	fmt.Println()
+
+	// Count and warn about clusters with override annotations
+	overrideCount := 0
+	for _, c := range candidates {
+		if _, hasOverride := c.Annotations["hypershift.openshift.io/cluster-size-override"]; hasOverride {
+			overrideCount++
+		}
+	}
+
+	if overrideCount > 0 {
+		fmt.Printf("⚠️  Note: %d cluster(s) have the 'cluster-size-override' annotation.\n", overrideCount)
+		fmt.Printf("    The autoscaling annotation will be added, but the override will remain.\n")
+		fmt.Printf("    Review and manually remove override annotations if appropriate.\n")
+		fmt.Println()
+	}
 }
 
 // displayResults prints a summary of the migration results.
