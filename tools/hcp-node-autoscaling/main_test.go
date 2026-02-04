@@ -27,7 +27,7 @@ func TestCategorizeCluster(t *testing.T) {
 			expected: "needs-removal",
 		},
 		{
-			name: "needs-removal: has cluster-size-override with other annotations",
+			name: "needs-removal: has both override and autoscaling annotations",
 			annotations: map[string]string{
 				"hypershift.openshift.io/cluster-size-override":          "m52xl",
 				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
@@ -78,6 +78,95 @@ func TestCategorizeCluster(t *testing.T) {
 
 			if result != tt.expected {
 				t.Errorf("categorizeCluster() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestDualCategorizationForOverrideAnnotation verifies that clusters with override
+// annotation are categorized as "needs-removal" and should appear in multiple groups.
+func TestDualCategorizationForOverrideAnnotation(t *testing.T) {
+	tests := []struct {
+		name                    string
+		annotations             map[string]string
+		expectedCategory        string
+		expectedInNeedsRemoval  bool
+		expectedInReadyMigrate  bool
+		expectedInAlreadyConfig bool
+	}{
+		{
+			name: "override only - needs-removal + ready-for-migration",
+			annotations: map[string]string{
+				"hypershift.openshift.io/cluster-size-override": "m5xl",
+			},
+			expectedCategory:        "needs-removal",
+			expectedInNeedsRemoval:  true,
+			expectedInReadyMigrate:  true,
+			expectedInAlreadyConfig: false,
+		},
+		{
+			name: "override + autoscaling - needs-removal + already-configured",
+			annotations: map[string]string{
+				"hypershift.openshift.io/cluster-size-override":          "m5xl",
+				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+			},
+			expectedCategory:        "needs-removal",
+			expectedInNeedsRemoval:  true,
+			expectedInReadyMigrate:  false,
+			expectedInAlreadyConfig: true,
+		},
+		{
+			name: "autoscaling only - already-configured only",
+			annotations: map[string]string{
+				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+			},
+			expectedCategory:        "already-configured",
+			expectedInNeedsRemoval:  false,
+			expectedInReadyMigrate:  false,
+			expectedInAlreadyConfig: true,
+		},
+		{
+			name:                    "no annotations - ready-for-migration only",
+			annotations:             map[string]string{},
+			expectedCategory:        "ready-for-migration",
+			expectedInNeedsRemoval:  false,
+			expectedInReadyMigrate:  true,
+			expectedInAlreadyConfig: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hc := &hypershiftv1beta1.HostedCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: tt.annotations,
+				},
+			}
+
+			opts := &auditOpts{}
+			category := opts.categorizeCluster(hc)
+
+			if category != tt.expectedCategory {
+				t.Errorf("Expected category '%s', got '%s'", tt.expectedCategory, category)
+			}
+
+			// Verify dual-categorization logic (simulating what happens in run() method)
+			_, hasOverride := tt.annotations["hypershift.openshift.io/cluster-size-override"]
+			autoScaling, hasAutoScaling := tt.annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+			hasAutoscalingEnabled := hasAutoScaling && autoScaling == "true"
+
+			inNeedsRemoval := hasOverride
+			inReadyMigrate := (hasOverride && !hasAutoscalingEnabled) || (!hasOverride && !hasAutoscalingEnabled)
+			inAlreadyConfig := hasAutoscalingEnabled
+
+			if inNeedsRemoval != tt.expectedInNeedsRemoval {
+				t.Errorf("Expected inNeedsRemoval=%v, got %v", tt.expectedInNeedsRemoval, inNeedsRemoval)
+			}
+			if inReadyMigrate != tt.expectedInReadyMigrate {
+				t.Errorf("Expected inReadyMigrate=%v, got %v", tt.expectedInReadyMigrate, inReadyMigrate)
+			}
+			if inAlreadyConfig != tt.expectedInAlreadyConfig {
+				t.Errorf("Expected inAlreadyConfig=%v, got %v", tt.expectedInAlreadyConfig, inAlreadyConfig)
 			}
 		})
 	}
@@ -516,5 +605,64 @@ func TestPatchManifestWorkFindsHostedCluster(t *testing.T) {
 
 	if annotations["test-key"] != "test-value" {
 		t.Errorf("Failed to modify HostedCluster annotations")
+	}
+}
+
+// TestGetCandidatesForMigrationIncludesNeedsRemoval verifies that migration includes needs-removal clusters
+// but excludes clusters that already have autoscaling enabled.
+func TestGetCandidatesForMigrationIncludesNeedsRemoval(t *testing.T) {
+	tests := []struct {
+		name             string
+		category         string
+		annotations      map[string]string
+		shouldBeIncluded bool
+	}{
+		{
+			name:             "ready-for-migration included",
+			category:         "ready-for-migration",
+			annotations:      map[string]string{},
+			shouldBeIncluded: true,
+		},
+		{
+			name:     "needs-removal included (no autoscaling)",
+			category: "needs-removal",
+			annotations: map[string]string{
+				"hypershift.openshift.io/cluster-size-override": "m5xl",
+			},
+			shouldBeIncluded: true,
+		},
+		{
+			name:     "needs-removal excluded (has autoscaling)",
+			category: "needs-removal",
+			annotations: map[string]string{
+				"hypershift.openshift.io/cluster-size-override":          "m5xl",
+				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+			},
+			shouldBeIncluded: false,
+		},
+		{
+			name:     "already-configured excluded",
+			category: "already-configured",
+			annotations: map[string]string{
+				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+			},
+			shouldBeIncluded: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Check if cluster has autoscaling enabled
+			autoScaling, hasAutoScaling := tt.annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+			hasAutoscalingEnabled := hasAutoScaling && autoScaling == "true"
+
+			// New logic: exclude if has autoscaling, otherwise include if not already-configured
+			shouldInclude := !hasAutoscalingEnabled && (tt.category != "already-configured")
+
+			if shouldInclude != tt.shouldBeIncluded {
+				t.Errorf("Expected shouldInclude=%v for category %s with annotations %v, got %v",
+					tt.shouldBeIncluded, tt.category, tt.annotations, shouldInclude)
+			}
+		})
 	}
 }

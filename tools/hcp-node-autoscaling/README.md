@@ -130,30 +130,52 @@ hcp-node-autoscaling rollback --hosted-cluster-id cluster-123 --skip-confirmatio
 
 ## Cluster Categories
 
-The tool categorizes hosted clusters into three groups:
+The tool categorizes hosted clusters into three groups.
 
-### Group A: Needs Annotation Removal
+**Note:** Clusters with the `cluster-size-override` annotation will appear in MULTIPLE groups for visibility:
+- Clusters with override + autoscaling enabled → appear in "Group A" AND "Already Configured"
+- Clusters with override but no autoscaling → appear in "Group A" AND "Group B: Ready for Migration"
+
+### Group A: Has Override Annotation
 
 Clusters that have the `hypershift.openshift.io/cluster-size-override` annotation.
 
-**Required Action**: Remove the `cluster-size-override` annotation before enabling autoscaling.
+**Important:** Clusters in this group may also appear in "Already Configured" if they have autoscaling enabled.
+
+The migrate command will:
+- Add autoscaling to clusters that don't have it yet
+- Skip clusters that already have autoscaling enabled
+
+**Required Action**:
+- For clusters without autoscaling: Run the migrate command to add autoscaling
+- For clusters with autoscaling already enabled: Manually review and remove the `cluster-size-override` annotation
+- Use the audit tool to identify which clusters appear in both groups
 
 ### Group B: Ready for Migration
 
-Clusters that meet ALL conditions:
-- Do NOT have `hypershift.openshift.io/cluster-size-override` annotation
-- Missing the required autoscaling annotation:
-  - `hypershift.openshift.io/resource-based-cp-auto-scaling: "true"`
+Clusters that are missing the autoscaling annotation:
+- Missing: `hypershift.openshift.io/resource-based-cp-auto-scaling: "true"`
 
-**Required Action**: Run the migrate command to automatically add the required annotation.
+**Important:** Clusters in this group may also appear in "Group A: Has Override Annotation" if they have the `cluster-size-override` annotation.
+
+**Required Action**:
+- Run the migrate command to automatically add the autoscaling annotation
+- If cluster also appears in Group A: The override annotation will remain after migration - remove it manually
 
 ### Already Configured
 
-Clusters that have the required autoscaling annotation properly set.
+Clusters that have the autoscaling annotation:
+- Have: `hypershift.openshift.io/resource-based-cp-auto-scaling: "true"`
 
-**Required Action**: None - autoscaling is already configured.
+**Important:** Clusters in this group may also appear in "Group A: Has Override Annotation" if they have the `cluster-size-override` annotation that needs to be removed.
+
+**Required Action**:
+- If cluster appears ONLY in this group: None - autoscaling is fully configured
+- If cluster also appears in Group A: Manually remove the `cluster-size-override` annotation
 
 ## How Migration Works
+
+**Note:** The migrate command now includes clusters with `cluster-size-override` annotations.
 
 The migrate command:
 
@@ -205,8 +227,8 @@ Found 150 OCM namespaces to audit (production and staging)
 Management Cluster: abc123def456
 Total Hosted Clusters Scanned: 150
 
-=== GROUP A: Needs Annotation Removal (5 clusters) ===
-These clusters have the cluster-size-override annotation that must be removed:
+=== GROUP A: Has Override Annotation (5 clusters) ===
+Clusters with cluster-size-override annotation (may also have autoscaling enabled):
 
 CLUSTER ID           CLUSTER NAME         NAMESPACE                    CURRENT SIZE
 cluster-001          prod-app-01          ocm-production-cluster-001   m54xl
@@ -214,7 +236,7 @@ cluster-002          staging-app-02       ocm-staging-cluster-002      m52xl
 ...
 
 === GROUP B: Ready for Migration (120 clusters) ===
-These clusters can be immediately migrated to autoscaling:
+Clusters ready for autoscaling migration (may also have cluster-size-override to remove):
 
 CLUSTER ID           CLUSTER NAME         NAMESPACE                    CURRENT SIZE
 cluster-003          prod-api-01          ocm-production-cluster-003   m52xl
@@ -222,7 +244,7 @@ cluster-004          staging-web-01       ocm-staging-cluster-004      m5xl
 ...
 
 === Already Configured (25 clusters) ===
-These clusters already have autoscaling annotations set:
+Clusters with autoscaling enabled (may also have cluster-size-override to remove):
 
 CLUSTER ID           CLUSTER NAME         NAMESPACE                    CURRENT SIZE
 cluster-005          prod-db-01           ocm-production-cluster-005   large
@@ -230,7 +252,7 @@ cluster-006          staging-cache-01     ocm-staging-cluster-006      m52xl
 ...
 
 Summary:
-  - Group A (Needs annotation removal): 5 clusters
+  - Group A (Has Override Annotation): 5 clusters
   - Group B (Ready for migration): 120 clusters
   - Already configured: 25 clusters
   - Errors: 0 namespaces
@@ -380,7 +402,7 @@ Performs **write operations**:
 - Polls HostedCluster resources on management cluster to verify sync
 
 Uses elevated permissions (cluster-admin via backplane) with audit trail:
-- Elevation reason: [SREP-2821](https://issues.redhat.com/browse/SREP-2821) Migrating hosted clusters to node autoscaling
+- Elevation reason: [SREP-2821](https://issues.redhat.com/browse/SREP-2821) Enabling request serving node autoscaling
 
 ### Rollback Command
 Performs **write operations**:
