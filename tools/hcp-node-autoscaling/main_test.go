@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"testing"
+	"time"
 
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -608,60 +609,218 @@ func TestPatchManifestWorkFindsHostedCluster(t *testing.T) {
 	}
 }
 
-// TestGetCandidatesForMigrationIncludesNeedsRemoval verifies that migration includes needs-removal clusters
-// but excludes clusters that already have autoscaling enabled.
-func TestGetCandidatesForMigrationIncludesNeedsRemoval(t *testing.T) {
+// TestConvertToFleetClusterInfo verifies conversion of audit info to fleet format.
+func TestConvertToFleetClusterInfo(t *testing.T) {
 	tests := []struct {
-		name             string
-		category         string
-		annotations      map[string]string
-		shouldBeIncluded bool
+		name                string
+		mgmtClusterID       string
+		auditInfo           *hostedClusterAuditInfo
+		expectedAutoscaling bool
+		expectedHasOverride bool
+		expectedRecommended string
 	}{
 		{
-			name:             "ready-for-migration included",
-			category:         "ready-for-migration",
-			annotations:      map[string]string{},
-			shouldBeIncluded: true,
+			name:          "cluster with autoscaling enabled",
+			mgmtClusterID: "mgmt-001",
+			auditInfo: &hostedClusterAuditInfo{
+				ClusterID:   "cluster-001",
+				ClusterName: "test-cluster-01",
+				CurrentSize: "medium",
+				Annotations: map[string]string{
+					"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+					"hypershift.openshift.io/recommended-cluster-size":       "large",
+				},
+			},
+			expectedAutoscaling: true,
+			expectedHasOverride: false,
+			expectedRecommended: "large",
 		},
 		{
-			name:     "needs-removal included (no autoscaling)",
-			category: "needs-removal",
-			annotations: map[string]string{
-				"hypershift.openshift.io/cluster-size-override": "m5xl",
+			name:          "cluster with override annotation",
+			mgmtClusterID: "mgmt-002",
+			auditInfo: &hostedClusterAuditInfo{
+				ClusterID:   "cluster-002",
+				ClusterName: "test-cluster-02",
+				CurrentSize: "small",
+				Annotations: map[string]string{
+					"hypershift.openshift.io/cluster-size-override": "m5xl",
+				},
 			},
-			shouldBeIncluded: true,
+			expectedAutoscaling: false,
+			expectedHasOverride: true,
+			expectedRecommended: "N/A",
 		},
 		{
-			name:     "needs-removal excluded (has autoscaling)",
-			category: "needs-removal",
-			annotations: map[string]string{
-				"hypershift.openshift.io/cluster-size-override":          "m5xl",
-				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+			name:          "cluster ready for migration",
+			mgmtClusterID: "mgmt-003",
+			auditInfo: &hostedClusterAuditInfo{
+				ClusterID:   "cluster-003",
+				ClusterName: "test-cluster-03",
+				CurrentSize: "medium",
+				Annotations: map[string]string{
+					"hypershift.openshift.io/recommended-cluster-size": "medium",
+				},
 			},
-			shouldBeIncluded: false,
+			expectedAutoscaling: false,
+			expectedHasOverride: false,
+			expectedRecommended: "medium",
 		},
 		{
-			name:     "already-configured excluded",
-			category: "already-configured",
-			annotations: map[string]string{
-				"hypershift.openshift.io/resource-based-cp-auto-scaling": "true",
+			name:          "cluster without recommended size",
+			mgmtClusterID: "mgmt-004",
+			auditInfo: &hostedClusterAuditInfo{
+				ClusterID:   "cluster-004",
+				ClusterName: "test-cluster-04",
+				CurrentSize: "large",
+				Annotations: map[string]string{},
 			},
-			shouldBeIncluded: false,
+			expectedAutoscaling: false,
+			expectedHasOverride: false,
+			expectedRecommended: "N/A",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Check if cluster has autoscaling enabled
-			autoScaling, hasAutoScaling := tt.annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
-			hasAutoscalingEnabled := hasAutoScaling && autoScaling == "true"
+			result := convertToFleetClusterInfo(tt.mgmtClusterID, tt.auditInfo)
 
-			// New logic: exclude if has autoscaling, otherwise include if not already-configured
-			shouldInclude := !hasAutoscalingEnabled && (tt.category != "already-configured")
+			if result.ManagementClusterID != tt.mgmtClusterID {
+				t.Errorf("Expected ManagementClusterID %s, got %s", tt.mgmtClusterID, result.ManagementClusterID)
+			}
 
-			if shouldInclude != tt.shouldBeIncluded {
-				t.Errorf("Expected shouldInclude=%v for category %s with annotations %v, got %v",
-					tt.shouldBeIncluded, tt.category, tt.annotations, shouldInclude)
+			if result.ClusterID != tt.auditInfo.ClusterID {
+				t.Errorf("Expected ClusterID %s, got %s", tt.auditInfo.ClusterID, result.ClusterID)
+			}
+
+			if result.ClusterName != tt.auditInfo.ClusterName {
+				t.Errorf("Expected ClusterName %s, got %s", tt.auditInfo.ClusterName, result.ClusterName)
+			}
+
+			if result.CurrentSize != tt.auditInfo.CurrentSize {
+				t.Errorf("Expected CurrentSize %s, got %s", tt.auditInfo.CurrentSize, result.CurrentSize)
+			}
+
+			if result.AutoscalingEnabled != tt.expectedAutoscaling {
+				t.Errorf("Expected AutoscalingEnabled %v, got %v", tt.expectedAutoscaling, result.AutoscalingEnabled)
+			}
+
+			if result.HasOverrideAnnotation != tt.expectedHasOverride {
+				t.Errorf("Expected HasOverrideAnnotation %v, got %v", tt.expectedHasOverride, result.HasOverrideAnnotation)
+			}
+
+			if result.RecommendedSize != tt.expectedRecommended {
+				t.Errorf("Expected RecommendedSize %s, got %s", tt.expectedRecommended, result.RecommendedSize)
+			}
+		})
+	}
+}
+
+// TestApplyFleetFilter verifies filtering of fleet audit results.
+func TestApplyFleetFilter(t *testing.T) {
+	// Create test data with different cluster types
+	testResults := &fleetAuditResults{
+		Timestamp:               time.Now(),
+		TotalManagementClusters: 2,
+		Clusters: []fleetClusterInfo{
+			// Needs removal (has override annotation)
+			{
+				ManagementClusterID:   "mgmt-001",
+				ClusterID:             "cluster-001",
+				ClusterName:           "test-override",
+				AutoscalingEnabled:    false,
+				HasOverrideAnnotation: true,
+				CurrentSize:           "medium",
+				RecommendedSize:       "large",
+			},
+			// Ready for migration (no autoscaling, no override)
+			{
+				ManagementClusterID:   "mgmt-001",
+				ClusterID:             "cluster-002",
+				ClusterName:           "test-ready",
+				AutoscalingEnabled:    false,
+				HasOverrideAnnotation: false,
+				CurrentSize:           "small",
+				RecommendedSize:       "medium",
+			},
+			// Already configured (has autoscaling)
+			{
+				ManagementClusterID:   "mgmt-002",
+				ClusterID:             "cluster-003",
+				ClusterName:           "test-configured",
+				AutoscalingEnabled:    true,
+				HasOverrideAnnotation: false,
+				CurrentSize:           "large",
+				RecommendedSize:       "N/A",
+			},
+			// Another ready for migration
+			{
+				ManagementClusterID:   "mgmt-002",
+				ClusterID:             "cluster-004",
+				ClusterName:           "test-ready-2",
+				AutoscalingEnabled:    false,
+				HasOverrideAnnotation: false,
+				CurrentSize:           "medium",
+				RecommendedSize:       "large",
+			},
+		},
+		TotalHostedClusters: 4,
+	}
+
+	tests := []struct {
+		name          string
+		showOnly      string
+		expectedCount int
+		expectedIDs   []string
+	}{
+		{
+			name:          "filter needs-removal",
+			showOnly:      "needs-removal",
+			expectedCount: 1,
+			expectedIDs:   []string{"cluster-001"},
+		},
+		{
+			name:          "filter ready-for-migration",
+			showOnly:      "ready-for-migration",
+			expectedCount: 3,
+			expectedIDs:   []string{"cluster-001", "cluster-002", "cluster-004"},
+		},
+		{
+			name:          "no filter returns all",
+			showOnly:      "",
+			expectedCount: 4,
+			expectedIDs:   []string{"cluster-001", "cluster-002", "cluster-003", "cluster-004"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &auditOpts{showOnly: tt.showOnly}
+
+			var filtered *fleetAuditResults
+			if tt.showOnly != "" {
+				filtered = opts.applyFleetFilter(testResults)
+			} else {
+				filtered = testResults
+			}
+
+			if len(filtered.Clusters) != tt.expectedCount {
+				t.Errorf("Expected %d clusters, got %d", tt.expectedCount, len(filtered.Clusters))
+			}
+
+			if filtered.TotalHostedClusters != tt.expectedCount {
+				t.Errorf("Expected TotalHostedClusters %d, got %d", tt.expectedCount, filtered.TotalHostedClusters)
+			}
+
+			// Verify the correct clusters are in the filtered results
+			foundIDs := make(map[string]bool)
+			for _, cluster := range filtered.Clusters {
+				foundIDs[cluster.ClusterID] = true
+			}
+
+			for _, expectedID := range tt.expectedIDs {
+				if !foundIDs[expectedID] {
+					t.Errorf("Expected to find cluster %s in filtered results", expectedID)
+				}
 			}
 		})
 	}
