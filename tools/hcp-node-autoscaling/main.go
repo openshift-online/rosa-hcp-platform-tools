@@ -40,6 +40,7 @@ type auditOpts struct {
 	output        string
 	showOnly      string
 	noHeaders     bool
+	concurrency   int
 
 	mgmtClient     client.Client
 	k8sClientMutex *sync.Mutex
@@ -211,6 +212,8 @@ Fleet mode:
 		"Filter output: needs-removal, ready-for-migration, safe-to-remove-override")
 	cmd.Flags().BoolVar(&opts.noHeaders, "no-headers", false,
 		"Skip table headers in output")
+	cmd.Flags().IntVar(&opts.concurrency, "concurrency", 10,
+		"Number of management clusters to audit concurrently (fleet mode only)")
 
 	cmd.MarkFlagsMutuallyExclusive("mgmt-cluster-id", "fleet")
 	cmd.MarkFlagsOneRequired("mgmt-cluster-id", "fleet")
@@ -370,7 +373,7 @@ func (a *auditOpts) runFleetAudit(ctx context.Context, conn *sdk.Connection) err
 	}
 
 	fmt.Printf("Found %d management clusters in fleet\n", len(mgmtClusterIDs))
-	fmt.Printf("Auditing clusters concurrently...\n\n")
+	fmt.Printf("Auditing clusters with concurrency limit of %d...\n\n", a.concurrency)
 
 	fleetResults := &fleetAuditResults{
 		Timestamp:               time.Now(),
@@ -389,12 +392,20 @@ func (a *auditOpts) runFleetAudit(ctx context.Context, conn *sdk.Connection) err
 	}
 	resultsChan := make(chan mcResult, len(mgmtClusterIDs))
 
+	semaphore := make(chan struct{}, a.concurrency)
+
 	for _, mgmtClusterID := range mgmtClusterIDs {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
 
-			mcClusters, err := a.auditSingleManagementCluster(ctx, conn, id)
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			auditCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			defer cancel()
+
+			mcClusters, err := a.auditSingleManagementCluster(auditCtx, conn, id)
 
 			resultsChan <- mcResult{
 				mgmtClusterID: id,
@@ -415,7 +426,7 @@ func (a *auditOpts) runFleetAudit(ctx context.Context, conn *sdk.Connection) err
 		fmt.Printf("Progress: %d/%d management clusters audited\n", completedCount, len(mgmtClusterIDs))
 
 		if result.err != nil {
-			fmt.Printf("  Warning: Failed to audit %s: %v\n", result.mgmtClusterID, result.err)
+			fmt.Printf("  • Management Cluster %s: %v\n", result.mgmtClusterID, result.err)
 			mu.Lock()
 			fleetResults.Errors = append(fleetResults.Errors, fleetAuditError{
 				ManagementClusterID: result.mgmtClusterID,
