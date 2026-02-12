@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"sync"
 	"time"
 
 	sdk "github.com/openshift-online/ocm-sdk-go"
@@ -24,13 +25,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const (
+	annotationResourceBasedAutoscaling = "hypershift.openshift.io/resource-based-cp-auto-scaling"
+	annotationClusterSizeOverride      = "hypershift.openshift.io/cluster-size-override"
+	annotationRecommendedClusterSize   = "hypershift.openshift.io/recommended-cluster-size"
+
+	labelHostedClusterSize = "hypershift.openshift.io/hosted-cluster-size"
+	labelClusterID         = "api.openshift.com/id"
+)
+
 type auditOpts struct {
 	mgmtClusterID string
+	fleet         bool
 	output        string
 	showOnly      string
 	noHeaders     bool
+	concurrency   int
 
-	mgmtClient client.Client
+	mgmtClient     client.Client
+	k8sClientMutex *sync.Mutex
 }
 
 type hostedClusterAuditInfo struct {
@@ -57,11 +70,36 @@ type auditError struct {
 	Error     string `json:"error" yaml:"error"`
 }
 
+type fleetAuditResults struct {
+	Timestamp               time.Time          `json:"timestamp" yaml:"timestamp"`
+	TotalManagementClusters int                `json:"total_mgmt_clusters" yaml:"total_mgmt_clusters"`
+	TotalHostedClusters     int                `json:"total_hosted_clusters" yaml:"total_hosted_clusters"`
+	Clusters                []fleetClusterInfo `json:"clusters" yaml:"clusters"`
+	Errors                  []fleetAuditError  `json:"errors,omitempty" yaml:"errors,omitempty"`
+}
+
+type fleetClusterInfo struct {
+	ManagementClusterID   string `json:"mgmt_cluster_id" yaml:"mgmt_cluster_id" csv:"mgmt_cluster_id"` // Actually stores management cluster name
+	ClusterID             string `json:"cluster_id" yaml:"cluster_id" csv:"cluster_id"`
+	ClusterName           string `json:"cluster_name" yaml:"cluster_name" csv:"cluster_name"`
+	AutoscalingEnabled    bool   `json:"autoscaling_enabled" yaml:"autoscaling_enabled" csv:"autoscaling_enabled"`
+	HasOverrideAnnotation bool   `json:"has_override" yaml:"has_override" csv:"has_override"`
+	CurrentSize           string `json:"current_size" yaml:"current_size" csv:"current_size"`
+	RecommendedSize       string `json:"recommended_size" yaml:"recommended_size" csv:"recommended_size"`
+}
+
+type fleetAuditError struct {
+	ManagementClusterID string `json:"mgmt_cluster_id" yaml:"mgmt_cluster_id"`
+	Namespace           string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
+	Error               string `json:"error" yaml:"error"`
+}
+
 type migrateOpts struct {
 	serviceClusterID string
 	mgmtClusterID    string
 	dryRun           bool
 	skipConfirmation bool
+	reason           string
 	serviceClient    client.Client
 	mgmtClient       client.Client
 	ocmConn          *sdk.Connection
@@ -80,6 +118,7 @@ type rollbackOpts struct {
 	hostedClusterID  string
 	dryRun           bool
 	skipConfirmation bool
+	reason           string
 	serviceClient    client.Client
 	mgmtClient       client.Client
 	ocmConn          *sdk.Connection
@@ -89,6 +128,9 @@ type rollbackOpts struct {
 }
 
 func main() {
+	// k8sClientMutex protects concurrent k8s client creation which uses non-thread-safe viper
+	k8sClientMutex := &sync.Mutex{}
+
 	rootCmd := &cobra.Command{
 		Use:   "hcp-node-autoscaling",
 		Short: "HCP node autoscaling audit and migration tool",
@@ -99,7 +141,7 @@ Use the audit subcommand to analyze clusters and the migrate subcommand to perfo
 the actual migration.`,
 	}
 
-	rootCmd.AddCommand(newAuditCmd())
+	rootCmd.AddCommand(newAuditCmd(k8sClientMutex))
 	rootCmd.AddCommand(newMigrateCmd())
 	rootCmd.AddCommand(newRollbackCmd())
 
@@ -110,28 +152,48 @@ the actual migration.`,
 }
 
 // newAuditCmd creates the audit subcommand for analyzing hosted clusters.
-func newAuditCmd() *cobra.Command {
-	opts := &auditOpts{}
+func newAuditCmd(k8sClientMutex *sync.Mutex) *cobra.Command {
+	opts := &auditOpts{
+		k8sClientMutex: k8sClientMutex,
+	}
 	cmd := &cobra.Command{
 		Use:   "audit",
-		Short: "Audit hosted clusters on a management cluster for autoscaling migration readiness",
-		Long: `Analyze all hosted clusters on a management cluster and categorize them based on their
-autoscaling migration readiness. Clusters are categorized into:
-- Group A: Needs annotation removal (have cluster-size-override annotation)
-- Group B: Ready for migration (missing required autoscaling annotations)
-- Already configured (have autoscaling annotations set)`,
+		Short: "Audit hosted clusters on management cluster(s) for autoscaling readiness",
+		Long: `Audit hosted clusters to determine their autoscaling migration readiness.
+
+Can audit a single management cluster or the entire fleet.
+
+Single cluster mode:
+  Requires --mgmt-cluster-id flag
+  Outputs detailed categorization (Group A, Group B, Already Configured)
+
+Fleet mode:
+  Use --fleet flag to audit all management clusters
+  Outputs flat table with autoscaling status across entire fleet`,
 		Example: `
-  # Audit all hosted clusters on a management cluster
-  hcp-node-autoscaling audit --mgmt-cluster-id mgmt-cluster-123
+  # Audit a single management cluster
+  hcp-node-autoscaling audit --mgmt-cluster-id mgmt-123
 
-  # Show only clusters that need annotation removal
-  hcp-node-autoscaling audit --mgmt-cluster-id mgmt-cluster-123 --show-only needs-removal
+  # Audit entire fleet
+  hcp-node-autoscaling audit --fleet
 
-  # Export to JSON for scripting
-  hcp-node-autoscaling audit --mgmt-cluster-id mgmt-cluster-123 --output json
+  # Fleet audit with CSV output
+  hcp-node-autoscaling audit --fleet --output csv
 
-  # Export to CSV for spreadsheet analysis
-  hcp-node-autoscaling audit --mgmt-cluster-id mgmt-cluster-123 --output csv
+  # Fleet audit - show only clusters ready for migration
+  hcp-node-autoscaling audit --fleet --show-only ready-for-migration
+
+  # Fleet audit - show only clusters that need annotation removal
+  hcp-node-autoscaling audit --fleet --show-only needs-removal
+
+  # Fleet audit - show only clusters safe to remove override (autoscaling enabled, has override, sizes match)
+  hcp-node-autoscaling audit --fleet --show-only safe-to-remove-override
+
+  # Single cluster - show only clusters that need annotation removal
+  hcp-node-autoscaling audit --mgmt-cluster-id mgmt-123 --show-only needs-removal
+
+  # Single cluster - export to JSON for scripting
+  hcp-node-autoscaling audit --mgmt-cluster-id mgmt-123 --output json
 `,
 		Args:              cobra.NoArgs,
 		DisableAutoGenTag: true,
@@ -140,11 +202,21 @@ autoscaling migration readiness. Clusters are categorized into:
 		},
 	}
 
-	cmd.Flags().StringVar(&opts.mgmtClusterID, "mgmt-cluster-id", "", "The management cluster ID to audit")
-	cmd.Flags().StringVar(&opts.output, "output", "text", "Output format: text, json, yaml, csv")
-	cmd.Flags().StringVar(&opts.showOnly, "show-only", "", "Filter results: needs-removal, ready-for-migration")
-	cmd.Flags().BoolVar(&opts.noHeaders, "no-headers", false, "Skip headers in output (for text and csv formats)")
-	_ = cmd.MarkFlagRequired("mgmt-cluster-id")
+	cmd.Flags().StringVar(&opts.mgmtClusterID, "mgmt-cluster-id", "",
+		"Management cluster ID to audit")
+	cmd.Flags().BoolVar(&opts.fleet, "fleet", false,
+		"Audit all management clusters in the fleet")
+	cmd.Flags().StringVar(&opts.output, "output", "text",
+		"Output format: text, json, yaml, csv")
+	cmd.Flags().StringVar(&opts.showOnly, "show-only", "",
+		"Filter output: needs-removal, ready-for-migration, safe-to-remove-override")
+	cmd.Flags().BoolVar(&opts.noHeaders, "no-headers", false,
+		"Skip table headers in output")
+	cmd.Flags().IntVar(&opts.concurrency, "concurrency", 10,
+		"Number of management clusters to audit concurrently (fleet mode only)")
+
+	cmd.MarkFlagsMutuallyExclusive("mgmt-cluster-id", "fleet")
+	cmd.MarkFlagsOneRequired("mgmt-cluster-id", "fleet")
 
 	return cmd
 }
@@ -155,30 +227,37 @@ func newMigrateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "migrate",
 		Short: "Enable autoscaling for hosted clusters on a service cluster",
-		Long: `Perform autoscaling migration for hosted clusters that are ready.
+		Long: `Perform autoscaling migration for hosted clusters.
 
 This command will:
-1. Audit the management cluster to find clusters ready for migration
-2. Display the list and ask for confirmation
-3. Patch ManifestWork resources on the service cluster
-4. Verify the annotations are synced to the management cluster
-5. Report results`,
+1. Audit the management cluster to find clusters for migration
+2. Include clusters without autoscaling (even if they have cluster-size-override)
+3. Display the list and ask for confirmation
+4. Patch ManifestWork resources on the service cluster
+5. Verify the annotations are synced to the management cluster
+6. Report results
+
+Note: Clusters with cluster-size-override annotation will also be migrated.
+The override annotation will remain - review and remove manually if needed.`,
 		Example: `
   # Migrate clusters with confirmation
   hcp-node-autoscaling migrate \
     --service-cluster-id svc-123 \
-    --mgmt-cluster-id mgmt-456
+    --mgmt-cluster-id mgmt-456 \
+    --reason "Enabling request serving node autoscaling"
 
   # Dry run to see what would be migrated
   hcp-node-autoscaling migrate \
     --service-cluster-id svc-123 \
     --mgmt-cluster-id mgmt-456 \
+    --reason "Enabling request serving node autoscaling" \
     --dry-run
 
   # Skip confirmation prompt (use with caution)
   hcp-node-autoscaling migrate \
     --service-cluster-id svc-123 \
     --mgmt-cluster-id mgmt-456 \
+    --reason "Enabling request serving node autoscaling" \
     --skip-confirmation`,
 		Args:              cobra.NoArgs,
 		DisableAutoGenTag: true,
@@ -191,6 +270,8 @@ This command will:
 		"The service cluster ID where ManifestWork resources exist")
 	cmd.Flags().StringVar(&opts.mgmtClusterID, "mgmt-cluster-id", "",
 		"The management cluster ID to migrate")
+	cmd.Flags().StringVar(&opts.reason, "reason", "",
+		"Reason for elevation (e.g., 'Enabling request serving node autoscaling')")
 	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false,
 		"Preview changes without applying them")
 	cmd.Flags().BoolVar(&opts.skipConfirmation, "skip-confirmation", false,
@@ -198,6 +279,7 @@ This command will:
 
 	_ = cmd.MarkFlagRequired("service-cluster-id")
 	_ = cmd.MarkFlagRequired("mgmt-cluster-id")
+	_ = cmd.MarkFlagRequired("reason")
 
 	return cmd
 }
@@ -218,13 +300,21 @@ This command will:
 5. Verify the annotations are synced back to the management cluster`,
 		Example: `
   # Rollback autoscaling for a hosted cluster
-  hcp-node-autoscaling rollback --hosted-cluster-id 1a2b3c4d5e6f7g8h9i0j
+  hcp-node-autoscaling rollback \
+    --hosted-cluster-id 1a2b3c4d5e6f7g8h9i0j \
+    --reason "Rolling back hosted cluster autoscaling migration"
 
   # Dry run to see what would be changed
-  hcp-node-autoscaling rollback --hosted-cluster-id cluster-123 --dry-run
+  hcp-node-autoscaling rollback \
+    --hosted-cluster-id cluster-123 \
+    --reason "Rolling back hosted cluster autoscaling migration" \
+    --dry-run
 
   # Skip confirmation prompt (use with caution)
-  hcp-node-autoscaling rollback --hosted-cluster-id cluster-123 --skip-confirmation`,
+  hcp-node-autoscaling rollback \
+    --hosted-cluster-id cluster-123 \
+    --reason "Rolling back hosted cluster autoscaling migration" \
+    --skip-confirmation`,
 		Args:              cobra.NoArgs,
 		DisableAutoGenTag: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -234,31 +324,30 @@ This command will:
 
 	cmd.Flags().StringVar(&opts.hostedClusterID, "hosted-cluster-id", "",
 		"The hosted cluster ID/name/external-id to rollback")
+	cmd.Flags().StringVar(&opts.reason, "reason", "",
+		"Reason for elevation (e.g., 'Rolling back hosted cluster autoscaling migration')")
 	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false,
 		"Preview changes without applying them")
 	cmd.Flags().BoolVar(&opts.skipConfirmation, "skip-confirmation", false,
 		"Skip confirmation prompt (use with caution)")
 
 	_ = cmd.MarkFlagRequired("hosted-cluster-id")
+	_ = cmd.MarkFlagRequired("reason")
 
 	return cmd
 }
 
 // run executes the audit command to analyze hosted clusters for autoscaling readiness.
 func (a *auditOpts) run(ctx context.Context) error {
-	if err := utils.IsValidClusterKey(a.mgmtClusterID); err != nil {
-		return err
-	}
-
 	validOutputs := map[string]bool{"text": true, "json": true, "yaml": true, "csv": true}
 	if !validOutputs[a.output] {
 		return fmt.Errorf("invalid output format '%s'. Valid options: text, json, yaml, csv", a.output)
 	}
 
 	if a.showOnly != "" {
-		validFilters := map[string]bool{"needs-removal": true, "ready-for-migration": true}
+		validFilters := map[string]bool{"needs-removal": true, "ready-for-migration": true, "safe-to-remove-override": true}
 		if !validFilters[a.showOnly] {
-			return fmt.Errorf("invalid show-only filter '%s'. Valid options: needs-removal, ready-for-migration", a.showOnly)
+			return fmt.Errorf("invalid show-only filter '%s'. Valid options: needs-removal, ready-for-migration, safe-to-remove-override", a.showOnly)
 		}
 	}
 
@@ -268,7 +357,107 @@ func (a *auditOpts) run(ctx context.Context) error {
 	}
 	defer connection.Close()
 
-	cluster, err := utils.GetCluster(connection, a.mgmtClusterID)
+	if a.fleet {
+		return a.runFleetAudit(ctx, connection)
+	}
+	return a.runSingleClusterAudit(ctx, connection)
+}
+
+// runFleetAudit audits all management clusters in the fleet.
+func (a *auditOpts) runFleetAudit(ctx context.Context, conn *sdk.Connection) error {
+	fmt.Println("Fleet-wide audit mode: Fetching management clusters...")
+
+	mgmtClusterIDs, err := getManagementClustersFromFleet(conn)
+	if err != nil {
+		return fmt.Errorf("failed to get management clusters: %v", err)
+	}
+
+	fmt.Printf("Found %d management clusters in fleet\n", len(mgmtClusterIDs))
+	fmt.Printf("Auditing clusters with concurrency limit of %d...\n\n", a.concurrency)
+
+	fleetResults := &fleetAuditResults{
+		Timestamp:               time.Now(),
+		TotalManagementClusters: len(mgmtClusterIDs),
+		Clusters:                []fleetClusterInfo{},
+		Errors:                  []fleetAuditError{},
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	type mcResult struct {
+		mgmtClusterID string
+		clusters      []fleetClusterInfo
+		err           error
+	}
+	resultsChan := make(chan mcResult, len(mgmtClusterIDs))
+
+	semaphore := make(chan struct{}, a.concurrency)
+
+	for _, mgmtClusterID := range mgmtClusterIDs {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			auditCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			defer cancel()
+
+			mcClusters, err := a.auditSingleManagementCluster(auditCtx, conn, id)
+
+			resultsChan <- mcResult{
+				mgmtClusterID: id,
+				clusters:      mcClusters,
+				err:           err,
+			}
+		}(mgmtClusterID)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	completedCount := 0
+	for result := range resultsChan {
+		completedCount++
+		fmt.Printf("Progress: %d/%d management clusters audited\n", completedCount, len(mgmtClusterIDs))
+
+		if result.err != nil {
+			fmt.Printf("  • Management Cluster %s: %v\n", result.mgmtClusterID, result.err)
+			mu.Lock()
+			fleetResults.Errors = append(fleetResults.Errors, fleetAuditError{
+				ManagementClusterID: result.mgmtClusterID,
+				Error:               result.err.Error(),
+			})
+			mu.Unlock()
+			continue
+		}
+
+		mu.Lock()
+		fleetResults.Clusters = append(fleetResults.Clusters, result.clusters...)
+		mu.Unlock()
+	}
+
+	fmt.Println()
+	fleetResults.TotalHostedClusters = len(fleetResults.Clusters)
+
+	if a.showOnly != "" {
+		fleetResults = a.applyFleetFilter(fleetResults)
+	}
+
+	return a.outputFleetResults(fleetResults)
+}
+
+// runSingleClusterAudit audits a single management cluster.
+func (a *auditOpts) runSingleClusterAudit(ctx context.Context, conn *sdk.Connection) error {
+	if err := utils.IsValidClusterKey(a.mgmtClusterID); err != nil {
+		return err
+	}
+
+	cluster, err := utils.GetCluster(conn, a.mgmtClusterID)
 	if err != nil {
 		return fmt.Errorf("failed to get cluster: %v", err)
 	}
@@ -294,13 +483,15 @@ func (a *auditOpts) run(ctx context.Context) error {
 		return fmt.Errorf("failed to add core v1 scheme: %v", err)
 	}
 
+	a.k8sClientMutex.Lock()
 	mgmtClient, err := k8s.New(a.mgmtClusterID, client.Options{Scheme: scheme})
+	a.k8sClientMutex.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to create management cluster client: %v", err)
 	}
 	a.mgmtClient = mgmtClient
 
-	namespaces, err := a.listOcmNamespaces(ctx)
+	namespaces, err := a.listOcmNamespacesForCluster(ctx, mgmtClient)
 	if err != nil {
 		return fmt.Errorf("failed to list namespaces: %v", err)
 	}
@@ -316,7 +507,7 @@ func (a *auditOpts) run(ctx context.Context) error {
 	}
 
 	for _, ns := range namespaces {
-		info, err := a.auditNamespace(ctx, ns.Name)
+		info, err := a.auditNamespaceForCluster(ctx, mgmtClient, ns.Name)
 		if err != nil {
 			results.Errors = append(results.Errors, auditError{
 				Namespace: ns.Name,
@@ -325,19 +516,37 @@ func (a *auditOpts) run(ctx context.Context) error {
 			continue
 		}
 
-		switch info.Category {
-		case "needs-removal":
+		_, hasOverride := info.Annotations[annotationClusterSizeOverride]
+		autoScaling, hasAutoScaling := info.Annotations[annotationResourceBasedAutoscaling]
+		hasAutoscalingEnabled := hasAutoScaling && autoScaling == "true"
+
+		if hasOverride {
 			results.NeedsLabelRemoval = append(results.NeedsLabelRemoval, *info)
-		case "ready-for-migration":
-			results.ReadyForMigration = append(results.ReadyForMigration, *info)
-		case "already-configured":
-			results.AlreadyConfigured = append(results.AlreadyConfigured, *info)
+			if hasAutoscalingEnabled {
+				results.AlreadyConfigured = append(results.AlreadyConfigured, *info)
+			} else {
+				results.ReadyForMigration = append(results.ReadyForMigration, *info)
+			}
+		} else {
+			if hasAutoscalingEnabled {
+				results.AlreadyConfigured = append(results.AlreadyConfigured, *info)
+			} else {
+				results.ReadyForMigration = append(results.ReadyForMigration, *info)
+			}
 		}
 	}
 
-	results.TotalScanned = len(results.NeedsLabelRemoval) +
-		len(results.ReadyForMigration) +
-		len(results.AlreadyConfigured)
+	uniqueClusters := make(map[string]bool)
+	for _, info := range results.NeedsLabelRemoval {
+		uniqueClusters[info.ClusterID] = true
+	}
+	for _, info := range results.ReadyForMigration {
+		uniqueClusters[info.ClusterID] = true
+	}
+	for _, info := range results.AlreadyConfigured {
+		uniqueClusters[info.ClusterID] = true
+	}
+	results.TotalScanned = len(uniqueClusters)
 
 	if a.showOnly != "" {
 		results = a.applyFilter(results)
@@ -346,10 +555,124 @@ func (a *auditOpts) run(ctx context.Context) error {
 	return a.outputResults(results)
 }
 
-// listOcmNamespaces returns OCM production and staging namespaces from the management cluster.
-func (a *auditOpts) listOcmNamespaces(ctx context.Context) ([]corev1.Namespace, error) {
+// getManagementClustersFromFleet queries the fleet management API to get all management clusters.
+func getManagementClustersFromFleet(conn *sdk.Connection) ([]string, error) {
+	response, err := conn.OSDFleetMgmt().V1().ManagementClusters().List().Send()
+	if err != nil {
+		return nil, fmt.Errorf("failed to query fleet management API: %v", err)
+	}
+
+	var clusterIDs []string
+	items := response.Items()
+	for i := 0; i < items.Len(); i++ {
+		cluster := items.Get(i)
+		clusterIDs = append(clusterIDs, cluster.Name())
+	}
+
+	if len(clusterIDs) == 0 {
+		return nil, fmt.Errorf("no management clusters found in fleet")
+	}
+
+	return clusterIDs, nil
+}
+
+// auditSingleManagementCluster audits a single management cluster and returns fleet cluster info.
+func (a *auditOpts) auditSingleManagementCluster(ctx context.Context, conn *sdk.Connection, mgmtClusterID string) ([]fleetClusterInfo, error) {
+	if err := utils.IsValidClusterKey(mgmtClusterID); err != nil {
+		return nil, err
+	}
+
+	cluster, err := utils.GetCluster(conn, mgmtClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster: %v", err)
+	}
+
+	isMC, err := utils.IsManagementCluster(cluster.ID())
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify management cluster: %v", err)
+	}
+	if !isMC {
+		return nil, fmt.Errorf("cluster %s is not a management cluster", cluster.ID())
+	}
+
+	resolvedMgmtClusterID := cluster.ID()
+	resolvedMgmtClusterName := cluster.Name()
+
+	scheme := runtime.NewScheme()
+	if err := hypershiftv1beta1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to add hypershift scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to add core v1 scheme: %v", err)
+	}
+
+	a.k8sClientMutex.Lock()
+	mgmtClient, err := k8s.New(resolvedMgmtClusterID, client.Options{Scheme: scheme})
+	a.k8sClientMutex.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create management cluster client: %v", err)
+	}
+
+	var namespaces []corev1.Namespace
+	maxRetries := 3
+	retryDelay := 2 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		namespaces, err = a.listOcmNamespacesForCluster(ctx, mgmtClient)
+		if err == nil {
+			break
+		}
+
+		if attempt == maxRetries {
+			return nil, fmt.Errorf("failed to list namespaces after %d attempts (cluster may be unreachable): %v", maxRetries, err)
+		}
+
+		time.Sleep(retryDelay)
+	}
+
+	var fleetClusters []fleetClusterInfo
+
+	for _, ns := range namespaces {
+		info, err := a.auditNamespaceForCluster(ctx, mgmtClient, ns.Name)
+		if err != nil {
+			fmt.Printf("    Warning: failed to audit namespace %s: %v\n", ns.Name, err)
+			continue
+		}
+
+		fleetCluster := convertToFleetClusterInfo(resolvedMgmtClusterName, info)
+		fleetClusters = append(fleetClusters, fleetCluster)
+	}
+
+	return fleetClusters, nil
+}
+
+// convertToFleetClusterInfo converts a hostedClusterAuditInfo to fleetClusterInfo format.
+func convertToFleetClusterInfo(mgmtClusterID string, info *hostedClusterAuditInfo) fleetClusterInfo {
+	autoScaling, hasAutoScaling := info.Annotations[annotationResourceBasedAutoscaling]
+	autoscalingEnabled := hasAutoScaling && autoScaling == "true"
+
+	_, hasOverride := info.Annotations[annotationClusterSizeOverride]
+
+	recommendedSize := info.Annotations[annotationRecommendedClusterSize]
+	if recommendedSize == "" {
+		recommendedSize = "N/A"
+	}
+
+	return fleetClusterInfo{
+		ManagementClusterID:   mgmtClusterID,
+		ClusterID:             info.ClusterID,
+		ClusterName:           info.ClusterName,
+		AutoscalingEnabled:    autoscalingEnabled,
+		HasOverrideAnnotation: hasOverride,
+		CurrentSize:           info.CurrentSize,
+		RecommendedSize:       recommendedSize,
+	}
+}
+
+// listOcmNamespacesForCluster returns OCM production and staging namespaces using provided client.
+func (a *auditOpts) listOcmNamespacesForCluster(ctx context.Context, kubeClient client.Client) ([]corev1.Namespace, error) {
 	nsList := &corev1.NamespaceList{}
-	if err := a.mgmtClient.List(ctx, nsList); err != nil {
+	if err := kubeClient.List(ctx, nsList); err != nil {
 		return nil, err
 	}
 
@@ -365,15 +688,21 @@ func (a *auditOpts) listOcmNamespaces(ctx context.Context) ([]corev1.Namespace, 
 	return filtered, nil
 }
 
-// auditNamespace analyzes a single namespace and returns audit information for the hosted cluster.
-func (a *auditOpts) auditNamespace(ctx context.Context, namespace string) (*hostedClusterAuditInfo, error) {
-	hc, err := a.getHostedClusterInNamespace(ctx, namespace)
+// listOcmNamespaces returns OCM production and staging namespaces from the management cluster.
+// This is a convenience wrapper for backward compatibility.
+func (a *auditOpts) listOcmNamespaces(ctx context.Context) ([]corev1.Namespace, error) {
+	return a.listOcmNamespacesForCluster(ctx, a.mgmtClient)
+}
+
+// auditNamespaceForCluster analyzes a single namespace using provided client.
+func (a *auditOpts) auditNamespaceForCluster(ctx context.Context, kubeClient client.Client, namespace string) (*hostedClusterAuditInfo, error) {
+	hc, err := a.getHostedClusterInNamespaceForClient(ctx, kubeClient, namespace)
 	if err != nil {
 		return nil, err
 	}
 
-	clusterID := hc.Labels["api.openshift.com/id"]
-	currentSize := hc.Labels["hypershift.openshift.io/hosted-cluster-size"]
+	clusterID := hc.Labels[labelClusterID]
+	currentSize := hc.Labels[labelHostedClusterSize]
 
 	category := a.categorizeCluster(hc)
 
@@ -388,12 +717,18 @@ func (a *auditOpts) auditNamespace(ctx context.Context, namespace string) (*host
 	}, nil
 }
 
-// getHostedClusterInNamespace retrieves the HostedCluster resource from a namespace.
-func (a *auditOpts) getHostedClusterInNamespace(ctx context.Context, namespace string) (*hypershiftv1beta1.HostedCluster, error) {
+// auditNamespace analyzes a single namespace and returns audit information for the hosted cluster.
+// This is a convenience wrapper for backward compatibility.
+func (a *auditOpts) auditNamespace(ctx context.Context, namespace string) (*hostedClusterAuditInfo, error) {
+	return a.auditNamespaceForCluster(ctx, a.mgmtClient, namespace)
+}
+
+// getHostedClusterInNamespaceForClient retrieves the HostedCluster resource using provided client.
+func (a *auditOpts) getHostedClusterInNamespaceForClient(ctx context.Context, kubeClient client.Client, namespace string) (*hypershiftv1beta1.HostedCluster, error) {
 	hcList := &hypershiftv1beta1.HostedClusterList{}
 	listOpts := []client.ListOption{client.InNamespace(namespace)}
 
-	if err := a.mgmtClient.List(ctx, hcList, listOpts...); err != nil {
+	if err := kubeClient.List(ctx, hcList, listOpts...); err != nil {
 		return nil, err
 	}
 
@@ -408,14 +743,19 @@ func (a *auditOpts) getHostedClusterInNamespace(ctx context.Context, namespace s
 	return &hcList.Items[0], nil
 }
 
+// getHostedClusterInNamespace retrieves the HostedCluster resource from a namespace.
+// This is a convenience wrapper for backward compatibility.
+func (a *auditOpts) getHostedClusterInNamespace(ctx context.Context, namespace string) (*hypershiftv1beta1.HostedCluster, error) {
+	return a.getHostedClusterInNamespaceForClient(ctx, a.mgmtClient, namespace)
+}
+
 // categorizeCluster determines the migration category for a hosted cluster.
 func (a *auditOpts) categorizeCluster(hc *hypershiftv1beta1.HostedCluster) string {
-	if _, hasOverride := hc.Annotations["hypershift.openshift.io/cluster-size-override"]; hasOverride {
+	if _, hasOverride := hc.Annotations[annotationClusterSizeOverride]; hasOverride {
 		return "needs-removal"
 	}
 
-	autoScaling, hasAutoScaling := hc.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
-
+	autoScaling, hasAutoScaling := hc.Annotations[annotationResourceBasedAutoscaling]
 	if hasAutoScaling && autoScaling == "true" {
 		return "already-configured"
 	}
@@ -437,10 +777,58 @@ func (a *auditOpts) applyFilter(results *auditResults) *auditResults {
 	case "ready-for-migration":
 		filtered.ReadyForMigration = results.ReadyForMigration
 		filtered.TotalScanned = len(results.ReadyForMigration)
+	case "safe-to-remove-override":
+		// Filter clusters where: autoscaling enabled + has override + current size matches recommended size
+		var safeToRemove []hostedClusterAuditInfo
+		for _, info := range results.AlreadyConfigured {
+			_, hasOverride := info.Annotations[annotationClusterSizeOverride]
+			recommendedSize := info.Annotations[annotationRecommendedClusterSize]
+			if hasOverride && recommendedSize != "" && info.CurrentSize == recommendedSize {
+				safeToRemove = append(safeToRemove, info)
+			}
+		}
+		filtered.AlreadyConfigured = safeToRemove
+		filtered.TotalScanned = len(safeToRemove)
 	default:
 		return results
 	}
 
+	return filtered
+}
+
+// applyFleetFilter filters fleet audit results based on the showOnly option.
+func (a *auditOpts) applyFleetFilter(results *fleetAuditResults) *fleetAuditResults {
+	filtered := &fleetAuditResults{
+		Timestamp:               results.Timestamp,
+		TotalManagementClusters: results.TotalManagementClusters,
+		Clusters:                []fleetClusterInfo{},
+		Errors:                  results.Errors,
+	}
+
+	for _, cluster := range results.Clusters {
+		isSafeToRemoveOverride := cluster.AutoscalingEnabled &&
+			cluster.HasOverrideAnnotation &&
+			cluster.RecommendedSize != "" &&
+			cluster.RecommendedSize != "N/A" &&
+			cluster.CurrentSize == cluster.RecommendedSize
+
+		switch a.showOnly {
+		case "needs-removal":
+			if cluster.HasOverrideAnnotation {
+				filtered.Clusters = append(filtered.Clusters, cluster)
+			}
+		case "ready-for-migration":
+			if !cluster.AutoscalingEnabled {
+				filtered.Clusters = append(filtered.Clusters, cluster)
+			}
+		case "safe-to-remove-override":
+			if isSafeToRemoveOverride {
+				filtered.Clusters = append(filtered.Clusters, cluster)
+			}
+		}
+	}
+
+	filtered.TotalHostedClusters = len(filtered.Clusters)
 	return filtered
 }
 
@@ -461,11 +849,12 @@ func (a *auditOpts) outputResults(results *auditResults) error {
 // printTextOutput prints audit results in human-readable text format.
 func (a *auditOpts) printTextOutput(results *auditResults) error {
 	fmt.Printf("\nManagement Cluster: %s\n", results.MgmtClusterID)
-	fmt.Printf("Total Hosted Clusters Scanned: %d\n\n", results.TotalScanned)
+	fmt.Printf("Total Hosted Clusters Scanned: %d\n", results.TotalScanned)
+	fmt.Printf("Note: Clusters with both override and autoscaling annotations appear in multiple groups\n\n")
 
 	if len(results.NeedsLabelRemoval) > 0 {
-		fmt.Printf("=== GROUP A: Needs Annotation Removal (%d clusters) ===\n", len(results.NeedsLabelRemoval))
-		fmt.Println("These clusters have the cluster-size-override annotation that must be removed:")
+		fmt.Printf("=== GROUP A: Has Override Annotation (%d clusters) ===\n", len(results.NeedsLabelRemoval))
+		fmt.Println("Clusters with cluster-size-override annotation (may also have autoscaling enabled):")
 
 		p := printer.NewTablePrinter(os.Stdout, 20, 1, 3, ' ')
 		if !a.noHeaders {
@@ -485,7 +874,7 @@ func (a *auditOpts) printTextOutput(results *auditResults) error {
 
 	if len(results.ReadyForMigration) > 0 {
 		fmt.Printf("=== GROUP B: Ready for Migration (%d clusters) ===\n", len(results.ReadyForMigration))
-		fmt.Println("These clusters can be immediately migrated to autoscaling:")
+		fmt.Println("Clusters ready for autoscaling migration (may also have cluster-size-override to remove):")
 
 		p := printer.NewTablePrinter(os.Stdout, 20, 1, 3, ' ')
 		if !a.noHeaders {
@@ -505,7 +894,7 @@ func (a *auditOpts) printTextOutput(results *auditResults) error {
 
 	if a.showOnly == "" && len(results.AlreadyConfigured) > 0 {
 		fmt.Printf("=== Already Configured (%d clusters) ===\n", len(results.AlreadyConfigured))
-		fmt.Println("These clusters already have autoscaling annotations set:")
+		fmt.Println("Clusters with autoscaling enabled (may also have cluster-size-override to remove):")
 
 		p := printer.NewTablePrinter(os.Stdout, 20, 1, 3, ' ')
 		if !a.noHeaders {
@@ -535,7 +924,7 @@ func (a *auditOpts) printTextOutput(results *auditResults) error {
 	}
 
 	fmt.Println("Summary:")
-	fmt.Printf("  - Group A (Needs annotation removal): %d clusters\n", len(results.NeedsLabelRemoval))
+	fmt.Printf("  - Group A (Has Override Annotation): %d clusters\n", len(results.NeedsLabelRemoval))
 	fmt.Printf("  - Group B (Ready for migration): %d clusters\n", len(results.ReadyForMigration))
 	fmt.Printf("  - Already configured: %d clusters\n", len(results.AlreadyConfigured))
 	fmt.Printf("  - Errors: %d namespaces\n", len(results.Errors))
@@ -572,6 +961,152 @@ func (a *auditOpts) printCSVOutput(results *auditResults) error {
 	allClusters := append(append(results.NeedsLabelRemoval, results.ReadyForMigration...), results.AlreadyConfigured...)
 	for _, c := range allClusters {
 		w.Write([]string{c.ClusterID, c.ClusterName, c.Namespace, c.CurrentSize, c.Category})
+	}
+
+	return nil
+}
+
+// outputFleetResults formats and prints fleet audit results.
+func (a *auditOpts) outputFleetResults(results *fleetAuditResults) error {
+	switch a.output {
+	case "json":
+		return a.printFleetJSON(results)
+	case "yaml":
+		return a.printFleetYAML(results)
+	case "csv":
+		return a.printFleetCSV(results)
+	default:
+		return a.printFleetTable(results)
+	}
+}
+
+// printFleetTable prints fleet results in table format.
+func (a *auditOpts) printFleetTable(results *fleetAuditResults) error {
+	fmt.Printf("\n=== Fleet-Wide Audit Results ===\n")
+	fmt.Printf("Timestamp: %s\n", results.Timestamp.Format(time.RFC3339))
+	fmt.Printf("Total Management Clusters: %d\n", results.TotalManagementClusters)
+	fmt.Printf("Total Hosted Clusters: %d\n\n", results.TotalHostedClusters)
+
+	if len(results.Clusters) == 0 {
+		fmt.Println("No hosted clusters found across fleet")
+		return nil
+	}
+
+	sort.Slice(results.Clusters, func(i, j int) bool {
+		if results.Clusters[i].ManagementClusterID != results.Clusters[j].ManagementClusterID {
+			return results.Clusters[i].ManagementClusterID < results.Clusters[j].ManagementClusterID
+		}
+		return results.Clusters[i].ClusterName < results.Clusters[j].ClusterName
+	})
+
+	p := printer.NewTablePrinter(os.Stdout, 20, 1, 3, ' ')
+
+	if !a.noHeaders {
+		p.AddRow([]string{
+			"MGMT CLUSTER NAME",
+			"CLUSTER ID",
+			"CLUSTER NAME",
+			"AUTOSCALING",
+			"HAS OVERRIDE",
+			"CURRENT SIZE",
+			"RECOMMENDED SIZE",
+		})
+	}
+
+	for _, c := range results.Clusters {
+		autoscalingStr := "❌"
+		if c.AutoscalingEnabled {
+			autoscalingStr = "✅"
+		}
+
+		overrideStr := "❌"
+		if c.HasOverrideAnnotation {
+			overrideStr = "✅"
+		}
+
+		p.AddRow([]string{
+			c.ManagementClusterID,
+			c.ClusterID,
+			c.ClusterName,
+			autoscalingStr,
+			overrideStr,
+			c.CurrentSize,
+			c.RecommendedSize,
+		})
+	}
+
+	p.Flush()
+	fmt.Println()
+
+	if len(results.Errors) > 0 {
+		fmt.Printf("\n=== Errors (%d) ===\n", len(results.Errors))
+		for _, e := range results.Errors {
+			fmt.Printf("  • Management Cluster %s", e.ManagementClusterID)
+			if e.Namespace != "" {
+				fmt.Printf(" / Namespace %s", e.Namespace)
+			}
+			fmt.Printf(": %s\n", e.Error)
+		}
+		fmt.Println()
+	}
+
+	return nil
+}
+
+// printFleetJSON prints fleet results in JSON format.
+func (a *auditOpts) printFleetJSON(results *fleetAuditResults) error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(results)
+}
+
+// printFleetYAML prints fleet results in YAML format.
+func (a *auditOpts) printFleetYAML(results *fleetAuditResults) error {
+	data, err := yaml.Marshal(results)
+	if err != nil {
+		return fmt.Errorf("failed to marshal to YAML: %v", err)
+	}
+	fmt.Println(string(data))
+	return nil
+}
+
+// printFleetCSV prints fleet results in CSV format.
+func (a *auditOpts) printFleetCSV(results *fleetAuditResults) error {
+	w := csv.NewWriter(os.Stdout)
+	defer w.Flush()
+
+	if !a.noHeaders {
+		w.Write([]string{
+			"mgmt_cluster_name",
+			"cluster_id",
+			"cluster_name",
+			"autoscaling_enabled",
+			"has_override",
+			"current_size",
+			"recommended_size",
+		})
+	}
+
+	for _, c := range results.Clusters {
+		autoscalingStr := "false"
+		if c.AutoscalingEnabled {
+			autoscalingStr = "true"
+		}
+
+		overrideStr := "false"
+		if c.HasOverrideAnnotation {
+			overrideStr = "true"
+		}
+
+		w.Write([]string{
+			c.ManagementClusterID,
+			c.ClusterID,
+			c.ClusterName,
+			autoscalingStr,
+			overrideStr,
+			c.CurrentSize,
+			c.RecommendedSize,
+		})
 	}
 
 	return nil
@@ -676,12 +1211,11 @@ func (m *migrateOpts) createClients(ctx context.Context) error {
 		return fmt.Errorf("failed to add work v1 scheme: %v", err)
 	}
 
-	elevationReason := "SREP-2821 - Migrating hosted clusters to node autoscaling"
 	serviceClient, err := k8s.NewAsBackplaneClusterAdminWithConn(
 		m.serviceClusterID,
 		client.Options{Scheme: scheme},
 		m.ocmConn,
-		elevationReason,
+		m.reason,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create service cluster client with elevated permissions: %v", err)
@@ -720,7 +1254,14 @@ func (m *migrateOpts) getCandidatesForMigration(ctx context.Context) ([]hostedCl
 			continue
 		}
 
-		if info.Category == "ready-for-migration" {
+		// Skip clusters that already have autoscaling enabled
+		autoScaling, hasAutoScaling := info.Annotations[annotationResourceBasedAutoscaling]
+		if hasAutoScaling && autoScaling == "true" {
+			continue
+		}
+
+		// Include clusters that need migration (ready-for-migration or needs-removal)
+		if info.Category != "already-configured" {
 			candidates = append(candidates, *info)
 		}
 	}
@@ -818,7 +1359,7 @@ func (m *migrateOpts) patchManifestWork(ctx context.Context, clusterID string) e
 			metadata["annotations"] = annotations
 		}
 
-		annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"] = "true"
+		annotations[annotationResourceBasedAutoscaling] = "true"
 
 		jsonData, err := json.Marshal(manifestData)
 		if err != nil {
@@ -905,7 +1446,7 @@ func (m *migrateOpts) hasRequiredAnnotations(hc *hypershiftv1beta1.HostedCluster
 		return false
 	}
 
-	autoScaling, hasAutoScaling := annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+	autoScaling, hasAutoScaling := annotations[annotationResourceBasedAutoscaling]
 
 	return hasAutoScaling && autoScaling == "true"
 }
@@ -928,8 +1469,23 @@ func (m *migrateOpts) displayCandidates(candidates []hostedClusterAuditInfo) {
 	fmt.Println()
 
 	fmt.Println("These clusters will receive the following annotation:")
-	fmt.Println("  - hypershift.openshift.io/resource-based-cp-auto-scaling: \"true\"")
+	fmt.Printf("  - %s: \"true\"\n", annotationResourceBasedAutoscaling)
 	fmt.Println()
+
+	// Count and warn about clusters with override annotations
+	overrideCount := 0
+	for _, c := range candidates {
+		if _, hasOverride := c.Annotations[annotationClusterSizeOverride]; hasOverride {
+			overrideCount++
+		}
+	}
+
+	if overrideCount > 0 {
+		fmt.Printf("⚠️  Note: %d cluster(s) have the 'cluster-size-override' annotation.\n", overrideCount)
+		fmt.Printf("    The autoscaling annotation will be added, but the override will remain.\n")
+		fmt.Printf("    Review and manually remove override annotations if appropriate.\n")
+		fmt.Println()
+	}
 }
 
 // displayResults prints a summary of the migration results.
@@ -1069,12 +1625,11 @@ func (r *rollbackOpts) initialize(ctx context.Context) error {
 	}
 	r.mgmtClient = mgmtClient
 
-	elevationReason := "SREP-2821 - Rolling back hosted cluster autoscaling migration"
 	serviceClient, err := k8s.NewAsBackplaneClusterAdminWithConn(
 		r.serviceClusterID,
 		client.Options{Scheme: scheme},
 		r.ocmConn,
-		elevationReason,
+		r.reason,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create service cluster client: %v", err)
@@ -1102,7 +1657,7 @@ func (r *rollbackOpts) findHostedCluster(ctx context.Context) (*hypershiftv1beta
 			continue
 		}
 
-		clusterID := hc.Labels["api.openshift.com/id"]
+		clusterID := hc.Labels[labelClusterID]
 		if clusterID == r.hostedClusterID || hc.Name == r.hostedClusterID {
 			return hc, ns.Name, nil
 		}
@@ -1113,10 +1668,10 @@ func (r *rollbackOpts) findHostedCluster(ctx context.Context) (*hypershiftv1beta
 
 // displayRollbackInfo shows information about the cluster to be rolled back.
 func (r *rollbackOpts) displayRollbackInfo(hc *hypershiftv1beta1.HostedCluster, namespace string) error {
-	clusterID := hc.Labels["api.openshift.com/id"]
-	currentSize := hc.Labels["hypershift.openshift.io/hosted-cluster-size"]
+	clusterID := hc.Labels[labelClusterID]
+	currentSize := hc.Labels[labelHostedClusterSize]
 
-	autoScaling, hasAutoScaling := hc.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+	autoScaling, hasAutoScaling := hc.Annotations[annotationResourceBasedAutoscaling]
 
 	fmt.Printf("=== Rollback Configuration ===\n\n")
 	fmt.Printf("Hosted Cluster ID: %s\n", clusterID)
@@ -1124,20 +1679,20 @@ func (r *rollbackOpts) displayRollbackInfo(hc *hypershiftv1beta1.HostedCluster, 
 	fmt.Printf("Namespace: %s\n", namespace)
 	fmt.Printf("Current Size: %s\n", currentSize)
 	fmt.Printf("\nCurrent autoscaling annotation: %s=%s\n",
-		"hypershift.openshift.io/resource-based-cp-auto-scaling", autoScaling)
+		annotationResourceBasedAutoscaling, autoScaling)
 
 	if !hasAutoScaling || autoScaling != "true" {
 		return fmt.Errorf("cluster does not have autoscaling enabled (annotation not set or not 'true')")
 	}
 
-	fmt.Printf("\nThis will remove the annotation: hypershift.openshift.io/resource-based-cp-auto-scaling\n")
+	fmt.Printf("\nThis will remove the annotation: %s\n", annotationResourceBasedAutoscaling)
 
 	return nil
 }
 
 // rollbackCluster removes autoscaling annotations from the cluster's ManifestWork.
 func (r *rollbackOpts) rollbackCluster(ctx context.Context, hc *hypershiftv1beta1.HostedCluster, namespace string) migrationResult {
-	clusterID := hc.Labels["api.openshift.com/id"]
+	clusterID := hc.Labels[labelClusterID]
 
 	result := migrationResult{
 		ClusterID:   clusterID,
@@ -1204,7 +1759,7 @@ func (r *rollbackOpts) removeManifestWorkAnnotation(ctx context.Context, cluster
 			continue
 		}
 
-		delete(annotations, "hypershift.openshift.io/resource-based-cp-auto-scaling")
+		delete(annotations, annotationResourceBasedAutoscaling)
 
 		jsonData, err := json.Marshal(manifestData)
 		if err != nil {
@@ -1265,7 +1820,7 @@ func (r *rollbackOpts) waitForRollbackSync(ctx context.Context, namespace, name 
 				continue
 			}
 
-			autoScaling, hasAutoScaling := hc.Annotations["hypershift.openshift.io/resource-based-cp-auto-scaling"]
+			autoScaling, hasAutoScaling := hc.Annotations[annotationResourceBasedAutoscaling]
 
 			if !hasAutoScaling || autoScaling != "true" {
 				fmt.Printf("  - Verified: Annotation removed from management cluster\n")
