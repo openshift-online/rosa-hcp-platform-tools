@@ -4,10 +4,8 @@ go 1.24.4
 
 require (
 	github.com/openshift-online/ocm-sdk-go v0.1.485
-	github.com/openshift/hypershift/api v0.0.0-20250208145556-2753dcc8cfb7
 	github.com/openshift/osdctl v0.0.0-20260119192622-cf2b358d06cd
 	github.com/spf13/cobra v1.10.1
-	k8s.io/api v0.32.6
 	k8s.io/apimachinery v0.32.6
 	open-cluster-management.io/api v0.15.0
 	sigs.k8s.io/controller-runtime v0.20.1
@@ -115,7 +113,6 @@ require (
 	github.com/openshift-online/ocm-api-model/model v0.0.439 // indirect
 	github.com/openshift-online/ocm-cli v1.0.8 // indirect
 	github.com/openshift-online/ocm-common v0.0.29 // indirect
-	github.com/openshift/api v0.0.0-20250207102212-9e59a77ed2e0 // indirect
 	github.com/openshift/aws-account-operator/api v0.0.0-20250205151445-6455c35fc4ae // indirect
 	github.com/openshift/backplane-api v0.0.0-20251104022300-74674d3b6921 // indirect
 	github.com/openshift/backplane-cli v0.6.1 // indirect
@@ -159,6 +156,7 @@ require (
 	gopkg.in/evanphx/json-patch.v4 v4.12.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	k8s.io/api v0.32.6 // indirect
 	k8s.io/cli-runtime v0.32.1 // indirect
 	k8s.io/client-go v0.32.6 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
