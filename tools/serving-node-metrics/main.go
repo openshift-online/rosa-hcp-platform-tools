@@ -70,7 +70,7 @@ func runMetrics(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get access token: %w", err)
 	}
-	fmt.Println("✓ Authenticated\n")
+	fmt.Println("✓ Authenticated")
 
 	// Collect metrics for all clusters
 	fmt.Println("[2/3] Querying metrics for all clusters...")
@@ -106,7 +106,7 @@ func runMetrics(cmd *cobra.Command, args []string) error {
 
 	// Display results in table
 	fmt.Println("\n[3/3] Results")
-	fmt.Println("==================================================\n")
+	fmt.Println("==================================================")
 
 	if len(allMetrics) == 0 {
 		fmt.Println("No metrics data collected.")
@@ -245,10 +245,10 @@ func executeQuery(dtURL, token, query string, hours int) (string, error) {
 	start := now.Add(time.Duration(-hours) * time.Hour).Format(time.RFC3339)
 
 	payload := map[string]interface{}{
-		"query":                  query,
-		"maxResultRecords":       10000,
-		"defaultTimeframeStart":  start,
-		"defaultTimeframeEnd":    end,
+		"query":                 query,
+		"maxResultRecords":      10000,
+		"defaultTimeframeStart": start,
+		"defaultTimeframeEnd":   end,
 	}
 
 	jsonData, _ := json.Marshal(payload)
@@ -330,7 +330,7 @@ func displayResults(result, metric string) error {
 
 	records := pollResp.Result.Records
 	if len(records) == 0 {
-		fmt.Println("  No data available\n")
+		fmt.Println("  No data available")
 		return nil
 	}
 
